@@ -233,18 +233,62 @@ export const UI_CSS = /* css */ `
 .tg-speed-v { min-width: 2em; text-align: right; font-size: 1.42em; font-weight: 850; font-variant-numeric: tabular-nums; }
 .tg-speed-u { font-size: .74em; font-weight: 750; color: var(--gold-hi); }
 
-/* Laderinge */
-.tg-charge, .tg-meter, .tg-timing { position: absolute; left: 0; top: 0; width: 0; height: 0; will-change: transform; }
-.tg-charge-in { position: absolute; left: -2.1em; top: -2.1em; width: 4.2em; height: 4.2em; opacity: 0; transform: scale(.55); transition: opacity .14s, transform .3s var(--e-back); }
-.tg-charge.is-on .tg-charge-in { opacity: 1; transform: none; }
-.tg-charge svg { width: 100%; height: 100%; display: block; transform: rotate(-90deg); overflow: visible; }
-.tg-charge-ticks { fill: none; stroke: rgba(246, 239, 223, .42); stroke-width: 1.5; stroke-dasharray: 1 4; }
-.tg-charge-trk { fill: rgba(3, 20, 13, .32); stroke: rgba(3, 20, 13, .55); stroke-width: 6.5; }
-.tg-charge-arc { fill: none; stroke: var(--pc, #fff); stroke-width: 5; stroke-linecap: round; filter: drop-shadow(0 0 2.5px var(--pc, #fff)); transition: stroke .2s; }
-.tg-charge-core { fill: var(--cream); opacity: .85; transform-origin: 32px 32px; transition: transform .2s, fill .2s; }
-.tg-charge.is-max .tg-charge-arc { stroke: var(--gold-hi); filter: drop-shadow(0 0 4px #f3d98a); }
-.tg-charge.is-max .tg-charge-core { fill: var(--gold-hi); transform: scale(1.35); }
-.tg-charge.is-max .tg-charge-in { animation: tgThrob .5s ease-in-out infinite alternate; }
+/* Powerbalken (Anker = Körpermitte des Spielers, Balken rechts daneben). Füllt sich von unten, friert beim Treffer ein. */
+.tg-charge, .tg-pow, .tg-meter, .tg-timing, .tg-flash { position: absolute; left: 0; top: 0; width: 0; height: 0; will-change: transform; }
+.tg-pow-in {
+  position: absolute; left: 2.4em; top: -5.2em; width: 1.9em; display: flex; flex-direction: column; align-items: center; gap: .35em;
+  opacity: 0; transform: translateX(-.5em) scale(.85); transform-origin: 50% 100%; transition: opacity .12s, transform .25s var(--e-back);
+}
+.tg-pow.is-on .tg-pow-in { opacity: 1; transform: none; }
+.tg-pow-trk {
+  position: relative; width: 1.25em; height: 8.6em; border-radius: .62em; overflow: visible;
+  background: linear-gradient(180deg, rgba(3, 20, 13, .82), rgba(3, 20, 13, .62));
+  box-shadow: inset 0 0 0 1.5px rgba(246, 239, 223, .55), 0 0 0 2px rgba(3, 20, 13, .55), 0 .3em .8em rgba(0, 0, 0, .45);
+}
+.tg-pow-trk i { position: absolute; left: .18em; right: .18em; height: 1px; background: rgba(246, 239, 223, .3); }
+.tg-pow-fill {
+  position: absolute; inset: .2em; border-radius: .45em; clip-path: inset(100% 0 0 0);
+  background: linear-gradient(0deg, #47d18c, #d7ee4b 55%, #ffb347 85%, #ff7a6b);
+  box-shadow: 0 0 .5em rgba(215, 238, 75, .55);
+}
+.tg-pow-mark { position: absolute; left: -.3em; right: -.3em; bottom: 0; height: 0; border-top: 2px solid var(--cream); opacity: 0; transition: opacity .1s; }
+.tg-pow.is-max .tg-pow-fill { box-shadow: 0 0 .9em rgba(255, 122, 107, .9); }
+.tg-pow.is-max .tg-pow-trk { box-shadow: inset 0 0 0 1.5px #f3d98a, 0 0 0 2px rgba(3, 20, 13, .55), 0 0 1em rgba(243, 217, 138, .8); }
+.tg-pow.is-max:not(.is-frozen) .tg-pow-trk { animation: tgThrob .45s ease-in-out infinite alternate; }
+.tg-pow.is-frozen .tg-pow-mark { opacity: 1; }
+.tg-pow.is-frozen .tg-pow-fill { filter: saturate(1.2) brightness(1.08); }
+.tg-pow-kmh {
+  position: absolute; left: 50%; top: 100%; margin-top: .3em; transform: translateX(-50%) scale(.6); opacity: 0; white-space: nowrap;
+  padding: .16em .5em; border-radius: .4em; background: rgba(3, 20, 13, .8); box-shadow: inset 0 0 0 1px rgba(246, 239, 223, .25);
+  transition: opacity .12s, transform .3s var(--e-back);
+}
+.tg-pow-kmh b { font-size: 1.05em; font-weight: 900; font-variant-numeric: tabular-nums; }
+.tg-pow-kmh span { margin-left: .2em; font-size: .62em; font-weight: 800; color: var(--gold-hi); }
+.tg-pow.has-kmh .tg-pow-kmh { opacity: 1; transform: translateX(-50%); }
+.tg-pow-net {
+  position: absolute; left: 50%; bottom: 100%; margin-bottom: .35em; transform: translateX(-50%); opacity: 0; white-space: nowrap;
+  padding: .12em .45em; border-radius: .35em; font-size: .62em; font-weight: 900; letter-spacing: .1em; text-transform: uppercase;
+  color: #fff; background: var(--red); box-shadow: 0 0 .6em rgba(229, 84, 75, .8); transition: opacity .12s;
+}
+.tg-pow.is-net .tg-pow-net { opacity: 1; }
+.tg-pow.is-net .tg-pow-trk { box-shadow: inset 0 0 0 1.5px var(--red), 0 0 .6em rgba(229, 84, 75, .7); }
+
+/* Zielkreis auf dem Platz (Bildschirm-Polygon). Rot = reicht über eine Linie. */
+.tg-aim { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.tg-aim-g { opacity: 0; transition: opacity .12s; }
+.tg-aim-g.is-on { opacity: 1; }
+.tg-aim-c { fill: rgba(255, 248, 226, .2); stroke: #fff8e2; stroke-width: 3.5; stroke-linejoin: round; filter: drop-shadow(0 0 3px rgba(0, 0, 0, .65)); }
+.tg-aim-g.is-red .tg-aim-c { fill: rgba(229, 84, 75, .3); stroke: #ff4a3c; }
+.tg-aim-dot { fill: #fff8e2; stroke: rgba(3, 20, 13, .8); stroke-width: 2; opacity: 0; }
+.tg-aim-g.is-land .tg-aim-dot { opacity: 1; }
+
+/* Trefferblitz */
+.tg-flash::before {
+  content: ''; position: absolute; left: -3em; top: -3em; width: 6em; height: 6em; border-radius: 50%;
+  background: radial-gradient(circle, rgba(255, 255, 255, 1) 0 12%, rgba(255, 240, 180, .85) 22%, rgba(243, 217, 138, .35) 45%, rgba(243, 217, 138, 0) 70%);
+  mix-blend-mode: screen;
+}
+.tg-flash { opacity: 0; }
 
 /* Aufschlag-Meter (Anker = unten links, rechts neben dem Spieler). Vertikal = Ballwurf-Höhe, der Ball fährt mit. */
 .tg-meter-in { position: absolute; left: 1.6em; bottom: 0; width: 3em; padding: .62em 0 .95em; border-radius: 1.5em; display: flex; flex-direction: column; align-items: center; gap: .75em; opacity: 0; transform: translateX(-.8em) scale(.92); transform-origin: 0 100%; transition: opacity .18s, transform .35s var(--e-out); }

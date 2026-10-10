@@ -328,6 +328,9 @@ export const LOCO_CLIPS = {
 // h, reach (Anteil des seitlichen Ausfallschritts), wide (bei tiefen Bällen breiter) }). heel: Fersenhub je Fuß [[t, rad]].
 // throat/grip: Gewicht der linken Hand am Schlägerhals bzw. am Griff (beidhändig) über die Zeit.
 // add: additive Varianten (Euler) für tiefe/hohe/weite/enge Bälle und Schlagarten (lob/drop).
+// cock: Zeitpunkt der größten Ausholbewegung (relativ zum Treffer). Ab dem Tastendruck hält die Figur die Pose zwischen
+//       Bereitschaft und cock (je voller der Powerbalken, desto weiter); der Vorschwung läuft von dort kurz und schnell.
+// wind: Zusatzdrehung (Euler, additiv) bei vollem Balken – Cartoon-Übertreibung der Ausholbewegung.
 
 // ---------------------------------------------------------------------------- Schlag-Keys
 // Erzeugt mit einer Autorenhilfe (Körper-Euler + Schläger-/Handziele -> Arm-Euler, Gelenkgrenzen), danach von Hand
@@ -432,6 +435,8 @@ const RELAX_ARM_R = { arm_r: [12, 8, -32], forearm_r: [32, -10, 0], hand_r: [-8,
 export const STROKE_ANIMS = {
   forehand: {
     keys: K_FOREHAND,
+    cock: -0.18,
+    wind: { root: [0, -16, 0], spine: [4, -10, 0], chest: [0, -14, 0], pelvisOffset: [0, -0.04, 0], shoulder_r: [0, 0, -6], arm_r: [-6, -10, 0] },
     steps: [
       { foot: 'r', t: -0.4, dur: 0.18, at: [-0.4, -0.1], yaw: -40, h: 0.06, reach: 0.9, wide: 1 },
       { foot: 'l', t: -0.24, dur: 0.17, at: [0.2, 0.22], yaw: -20, h: 0.05, wide: 1 },
@@ -449,6 +454,8 @@ export const STROKE_ANIMS = {
   },
   backhand: {
     keys: K_BACKHAND,
+    cock: -0.18,
+    wind: { root: [0, 16, 0], spine: [4, 10, 0], chest: [0, 14, 0], pelvisOffset: [0, -0.04, 0], arm_r: [-6, 8, 0] },
     steps: [
       { foot: 'l', t: -0.42, dur: 0.16, at: [0.32, -0.12], yaw: 35, h: 0.05, wide: 1 },
       { foot: 'r', t: -0.3, dur: 0.18, at: [0.08, 0.3], yaw: 55, h: 0.06, reach: 0.9 },
@@ -466,6 +473,8 @@ export const STROKE_ANIMS = {
   },
   backhand2: {
     keys: K_BACKHAND2,
+    cock: -0.18,
+    wind: { root: [0, 16, 0], spine: [4, 10, 0], chest: [0, 14, 0], pelvisOffset: [0, -0.04, 0] },
     steps: [
       { foot: 'l', t: -0.42, dur: 0.16, at: [0.32, -0.12], yaw: 35, h: 0.05, wide: 1 },
       { foot: 'r', t: -0.3, dur: 0.18, at: [0.1, 0.28], yaw: 45, h: 0.06, reach: 0.9 },
@@ -484,6 +493,8 @@ export const STROKE_ANIMS = {
   },
   forehand_slice: {
     keys: K_FOREHAND_SLICE,
+    cock: -0.2,
+    wind: { root: [0, -12, 0], spine: [4, -8, 0], chest: [0, -12, 0], pelvisOffset: [0, -0.03, 0], arm_r: [6, 0, 8] },
     steps: [
       { foot: 'r', t: -0.4, dur: 0.15, at: [-0.3, -0.05], yaw: -50, h: 0.05, reach: 0.6 },
       { foot: 'l', t: -0.3, dur: 0.2, at: [0.02, 0.34], yaw: -35, h: 0.06, reach: 0.4 },
@@ -501,6 +512,8 @@ export const STROKE_ANIMS = {
   },
   backhand_slice: {
     keys: K_BACKHAND_SLICE,
+    cock: -0.18,
+    wind: { root: [0, 12, 0], spine: [4, 8, 0], chest: [0, 12, 0], pelvisOffset: [0, -0.03, 0], arm_r: [6, 0, 6] },
     steps: [
       { foot: 'l', t: -0.4, dur: 0.15, at: [0.3, -0.06], yaw: 45, h: 0.05, reach: 0.6 },
       { foot: 'r', t: -0.3, dur: 0.2, at: [0.04, 0.34], yaw: 50, h: 0.06, reach: 0.4 },
@@ -518,6 +531,8 @@ export const STROKE_ANIMS = {
   },
   forehand_volley: {
     keys: K_FOREHAND_VOLLEY,
+    cock: -0.1,
+    wind: { root: [0, -8, 0], chest: [0, -8, 0], pelvisOffset: [0, -0.03, 0] },
     steps: [
       { foot: 'l', t: -0.18, dur: 0.16, at: [0.0, 0.36], yaw: -25, h: 0.05, reach: 0.5 },
       { foot: 'r', t: 0.12, dur: 0.18, at: [-0.24, 0.1], yaw: -5, h: 0.05 },
@@ -533,6 +548,8 @@ export const STROKE_ANIMS = {
   },
   backhand_volley: {
     keys: K_BACKHAND_VOLLEY,
+    cock: -0.1,
+    wind: { root: [0, 8, 0], chest: [0, 8, 0], pelvisOffset: [0, -0.03, 0] },
     steps: [
       { foot: 'r', t: -0.18, dur: 0.16, at: [0.08, 0.36], yaw: 35, h: 0.05, reach: 0.5 },
       { foot: 'l', t: 0.12, dur: 0.18, at: [0.25, 0.08], yaw: 8, h: 0.05 },
@@ -548,6 +565,8 @@ export const STROKE_ANIMS = {
   },
   smash: {
     keys: K_SMASH,
+    cock: -0.14,
+    wind: { spine: [-6, -6, 0], chest: [-4, -8, 0], arm_r: [0, 0, 10] },
     steps: [
       { foot: 'r', t: -0.48, dur: 0.16, at: [-0.3, -0.3], yaw: -80, h: 0.05 },
       { foot: 'l', t: -0.4, dur: 0.16, at: [0.14, 0.1], yaw: -40, h: 0.05 },
@@ -638,7 +657,7 @@ export function buildAnimSet(id, def) {
     // Persönlichkeit: Gerry spielt die Rückhand beidhändig
     const src = (gerry && type === 'backhand') ? STROKE_ANIMS.backhand2 : STROKE_ANIMS[type];
     const W = STROKES[type].windup, F = STROKES[type].follow;
-    set.strokes[type] = { ...src, W, F, clip: strokeClip(type, src.keys, W, F), add: addPoses(def, src.add) };
+    set.strokes[type] = { ...src, W, F, clip: strokeClip(type, src.keys, W, F), add: addPoses(def, src.add), wind: src.wind ? poseFromEuler(def, src.wind) : null };
   }
   const SV = SERVE_ANIM;
   set.serve = {

@@ -1,6 +1,7 @@
 // In-Game-HUD: Broadcast-Scorebug (oben links) mit Flaggen (Breakball/Satzball/Matchball),
-// Aufschlag-Tempo, Schlag-Ladering am Spieler, Aufschlag-Timing-Meter und Timing-Feedback.
-// Alle Per-Frame-Methoden (charge, serveMeter) schreiben nur bei Änderung ins DOM.
+// Aufschlag-Tempo, Powerbalken am Spieler (friert beim Treffer ein, zeigt km/h), Zielkreis auf dem Platz,
+// Trefferblitz, Aufschlag-Timing-Meter und Timing-Feedback.
+// Alle Per-Frame-Methoden (power, aimCircle, serveMeter) schreiben nur bei Änderung ins DOM.
 
 import { h, esc, cssColor, animate } from './dom.js';
 import { icon } from './icons.js';
@@ -19,7 +20,10 @@ const TIMING_TEXT = {
   late: ['Zu spät', 'bad'],
   stretch: ['Gestreckt', 'meh'],
   frame: ['Rahmen!', 'bad'],
+  miss: ['Daneben!', 'bad'],
+  rescue: ['Gerettet!', 'meh'],
 };
+const SVGNS = 'http://www.w3.org/2000/svg';
 
 const FLAG_TEXT = { break: ['BREAKBALL', 'BREAKBÄLLE'], set: ['SATZBALL', 'SATZBÄLLE'], match: ['MATCHBALL', 'MATCHBÄLLE'] };
 
@@ -170,18 +174,39 @@ export class Hud {
 
     this.tl.append(this.bug, this.flagWrap, this.speedWrap);
 
-    // ---------- Laderinge (pro Spieler)
-    this.charges = [0, 1].map((i) => {
-      const el = h('div', `tg-charge tg-charge-${i}`);
-      el.innerHTML = `<div class="tg-charge-in">
-        <svg viewBox="0 0 64 64" aria-hidden="true">
-          <circle class="tg-charge-ticks" cx="32" cy="32" r="29.5" pathLength="120"/>
-          <circle class="tg-charge-trk" cx="32" cy="32" r="24"/>
-          <circle class="tg-charge-arc" cx="32" cy="32" r="24" pathLength="100" stroke-dasharray="100 100" stroke-dashoffset="100"/>
-          <circle class="tg-charge-core" cx="32" cy="32" r="5"/>
-        </svg></div>`;
-      return { el, arc: el.querySelector('.tg-charge-arc'), on: false, v: -1, x: NaN, y: NaN, max: false };
+    // ---------- Zielkreise auf dem Platz (pro Spieler, Bildschirm-Polygon) + Landepunkt
+    this.aimSvg = document.createElementNS(SVGNS, 'svg');
+    this.aimSvg.setAttribute('class', 'tg-aim');
+    this.aimSvg.setAttribute('aria-hidden', 'true');
+    this.aims = [0, 1].map((i) => {
+      const g = document.createElementNS(SVGNS, 'g');
+      g.setAttribute('class', `tg-aim-g tg-aim-${i}`);
+      const path = document.createElementNS(SVGNS, 'path');
+      path.setAttribute('class', 'tg-aim-c');
+      const dot = document.createElementNS(SVGNS, 'circle');
+      dot.setAttribute('class', 'tg-aim-dot'); dot.setAttribute('r', '5');
+      g.append(path, dot);
+      this.aimSvg.appendChild(g);
+      return { g, path, dot, on: false, red: false, d: '', land: false };
     });
+
+    // ---------- Powerbalken (pro Spieler): füllt sich von unten, friert beim Treffer ein, zeigt dann km/h
+    this.powers = [0, 1].map((i) => {
+      const el = h('div', `tg-pow tg-pow-${i}`);
+      el.innerHTML = `<div class="tg-pow-in">
+        <div class="tg-pow-net">Netz!</div>
+        <div class="tg-pow-trk"><div class="tg-pow-fill"></div><i style="bottom:25%"></i><i style="bottom:50%"></i><i style="bottom:75%"></i><div class="tg-pow-mark"></div></div>
+        <div class="tg-pow-kmh"><b>0</b><span>km/h</span></div>
+      </div>`;
+      return {
+        el, fill: el.querySelector('.tg-pow-fill'), mark: el.querySelector('.tg-pow-mark'), kmh: el.querySelector('.tg-pow-kmh b'),
+        on: false, v: -1, x: NaN, y: NaN, max: false, frozen: false, net: false, k: -1,
+      };
+    });
+    this.charges = this.powers;     // Altname (Spielerfarbe setzen)
+
+    // ---------- Trefferblitz
+    this.flash = h('div', 'tg-flash');
 
     // ---------- Aufschlag-Meter
     this.meter = h('div', 'tg-meter');
@@ -201,7 +226,7 @@ export class Hud {
     this._popIdx = 0;
     this._lastAnchor = [null, null];
 
-    this.el.append(this.tl, ...this.charges.map((c) => c.el), this.meter, ...this.pops);
+    this.el.append(this.aimSvg, this.tl, ...this.powers.map((c) => c.el), this.flash, this.meter, ...this.pops);
     this.setPlayers(this.players);
   }
 
@@ -214,7 +239,7 @@ export class Hud {
   hide() {
     this.visible = false;
     this.el.classList.remove('is-on');
-    this.charge(0, null); this.charge(1, null); this.serveMeter(null);
+    this.power(0, null); this.power(1, null); this.aimCircle(0, null); this.aimCircle(1, null); this.serveMeter(null);
   }
 
   /** [{ name, color, id? }, …] — Farbe als '#hex' oder [r,g,b]. */
@@ -232,7 +257,8 @@ export class Hud {
     this.players.forEach((p, i) => {
       this.rows[i].name.textContent = String(p.name).toUpperCase();
       this.rows[i].row.style.setProperty('--pc', p.color);
-      this.charges[i].el.style.setProperty('--pc', p.color);
+      this.powers[i].el.style.setProperty('--pc', p.color);
+      this.aims[i].g.style.setProperty('--pc', p.color);
     });
     this.ui?._playersChanged?.(this.players);
   }
@@ -343,12 +369,18 @@ export class Hud {
     return idx === 0 ? [W * 0.5, H * 0.74] : [W * 0.5, H * 0.34];
   }
 
-  /** Schlag-Ladering: v 0..1 (null = aus), screenPos = {x,y} | [x,y] in CSS-Pixeln (Ringmitte). */
-  charge(idx, v, screenPos) {
-    const c = this.charges[idx];
+  /** Altname: Schlag-Ladung = Powerbalken. */
+  charge(idx, v, screenPos) { this.power(idx, v, screenPos); }
+
+  /**
+   * Powerbalken am Spieler: v 0..1 (null = aus), screenPos = {x,y} | [x,y] (CSS-Pixel, Körpermitte; der Balken steht rechts
+   * daneben). o = { frozen: Treffer (Wert eingefroren), kmh: Tempo nach dem Treffer, net: Netz-Warnung (tiefer Ball + volle Kraft) }.
+   */
+  power(idx, v, screenPos, o = null) {
+    const c = this.powers[idx];
     if (!c) return;
     if (v == null || v < 0) {
-      if (c.on) { c.on = false; c.el.classList.remove('is-on', 'is-max'); c.max = false; c.v = -1; }
+      if (c.on) { c.on = false; c.el.classList.remove('is-on', 'is-max', 'is-frozen', 'has-kmh', 'is-net'); c.max = c.frozen = c.net = false; c.v = -1; c.k = -1; }
       return;
     }
     let x, y;
@@ -363,12 +395,53 @@ export class Hud {
     a[0] = x; a[1] = y;
     if (!c.on) { c.on = true; c.el.classList.add('is-on'); }
     v = v > 1 ? 1 : v;
-    if (Math.abs(v - c.v) > 0.003) {
+    if (Math.abs(v - c.v) > 0.002) {
       c.v = v;
-      c.arc.setAttribute('stroke-dashoffset', (100 - v * 100).toFixed(1));
+      c.fill.style.clipPath = `inset(${((1 - v) * 100).toFixed(2)}% 0 0 0)`;
+      c.mark.style.transform = `translateY(${(-v * 100).toFixed(2)}%)`;
       const max = v >= 0.985;
       if (max !== c.max) { c.max = max; c.el.classList.toggle('is-max', max); }
     }
+    const frozen = !!(o && o.frozen), net = !!(o && o.net);
+    if (frozen !== c.frozen) { c.frozen = frozen; c.el.classList.toggle('is-frozen', frozen); }
+    if (net !== c.net) { c.net = net; c.el.classList.toggle('is-net', net); }
+    const k = o && o.kmh > 0 ? Math.round(o.kmh) : -1;
+    if (k !== c.k) {
+      c.k = k;
+      c.el.classList.toggle('has-kmh', k > 0);
+      if (k > 0) c.kmh.textContent = String(k);
+    }
+  }
+
+  /**
+   * Zielkreis auf dem Platz: pts = Bildschirmpunkte [x0, y0, x1, y1, …] (geschlossenes Polygon) oder null (aus).
+   * o = { red: Kreis reicht über eine Linie, land: [x, y] Landepunkt (nach dem Treffer), fade: 0..1 Ausblenden }.
+   */
+  aimCircle(idx, pts, o = null) {
+    const c = this.aims[idx];
+    if (!c) return;
+    if (!pts) { if (c.on) { c.on = false; c.g.classList.remove('is-on', 'is-red', 'is-land'); c.red = c.land = false; c.d = ''; c.path.setAttribute('d', ''); } return; }
+    let d = '';
+    for (let i = 0; i + 1 < pts.length; i += 2) d += (i ? 'L' : 'M') + pts[i].toFixed(1) + ' ' + pts[i + 1].toFixed(1);
+    d += 'Z';
+    if (d !== c.d) { c.d = d; c.path.setAttribute('d', d); }
+    if (!c.on) { c.on = true; c.g.classList.add('is-on'); }
+    const red = !!(o && o.red);
+    if (red !== c.red) { c.red = red; c.g.classList.toggle('is-red', red); }
+    const land = o && o.land;
+    if (!!land !== c.land) { c.land = !!land; c.g.classList.toggle('is-land', !!land); }
+    if (land) { c.dot.setAttribute('cx', land[0].toFixed(1)); c.dot.setAttribute('cy', land[1].toFixed(1)); }
+    c.g.style.opacity = o && o.fade != null ? (1 - o.fade).toFixed(3) : '';
+  }
+
+  /** Trefferblitz an screenPos (CSS-Pixel), strength 0..1. */
+  impact(screenPos, strength = 1) {
+    const x = screenPos.x ?? screenPos[0], y = screenPos.y ?? screenPos[1];
+    const t = `translate3d(${x.toFixed(1)}px, ${y.toFixed(1)}px, 0)`, k = 0.6 + 0.6 * strength;
+    animate(this.flash, [
+      { opacity: Math.min(1, 0.55 + 0.45 * strength), transform: `${t} scale(${(0.45 * k).toFixed(2)})` },
+      { opacity: 0, transform: `${t} scale(${(1.5 * k).toFixed(2)})` },
+    ], { duration: 280, easing: 'cubic-bezier(.2,.7,.2,1)' });
   }
 
   /**

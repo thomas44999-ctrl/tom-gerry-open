@@ -6,8 +6,8 @@ import { COURT, inServiceBox, isInSingles, serverPosition, receiverPosition, lin
 import { Ball, BALL, predict, RPM } from '../sim/ball.js';
 import { serveTarget, solveShot } from '../sim/shot.js';
 import { Score } from '../sim/rules.js';
-import { STROKES, SERVE } from '../sim/strokes.js';
-import { Player, Rng, planIntercept, contactQuality, resolveShot, strokeKey, difficultyOf, rotateVel } from './player.js';
+import { STROKES, SERVE, CHARGE, HIT, strokeContactWorld } from '../sim/strokes.js';
+import { Player, Rng, planIntercept, contactQuality, strokeQuality, resolveShot, previewShot, strokeKey, rotateVel, assistOf, hitRadius, lungeOf, contactAt } from './player.js';
 import { AIController } from './ai.js';
 
 export const MATCH_DT = 1 / 120;
@@ -47,7 +47,10 @@ const _shot = {};
 export class Match {
   /**
    * opts = { players: ['tom','gerry'], humans: [0], format, difficulty: 'easy'|'normal'|'hard' | [d0, d1], seed,
+   *          assist?: 'off'|'light'|'strong' (Laufhilfe für Menschen, Standard 'light'), breakOnHit?: false,
    *          names?: ['Tom','Gerry'], surface? }
+   * breakOnHit: step() endet nach dem Takt eines Treffers (Rest bleibt im Akkumulator) – die Darstellung kann so genau
+   * das Bild des Kontakts zeigen (Schläger am Ball, Treffer-Stopp).
    */
   constructor(opts = {}) {
     const ids = opts.players || ['tom', 'gerry'];
@@ -55,7 +58,10 @@ export class Match {
     const diffs = Array.isArray(opts.difficulty) ? opts.difficulty : [opts.difficulty || 'normal', opts.difficulty || 'normal'];
     this.seed = (opts.seed ?? 1) >>> 0;
     this.rng = new Rng(this.seed * 2654435761 + 17);
-    this.players = ids.map((id, i) => new Player(i, id, { human: this.humans.includes(i), difficulty: diffs[i] }));
+    this.assist = opts.assist || 'light';
+    this.players = ids.map((id, i) => new Player(i, id, { human: this.humans.includes(i), difficulty: diffs[i], assist: this.assist }));
+    this.breakOnHit = !!opts.breakOnHit;
+    this._hitTick = false;
     const names = opts.names || this.players.map((p) => p.name);
     this.score = new Score(names, opts.format || {});
     this.ball = new Ball();
@@ -103,8 +109,16 @@ export class Match {
     this._acc += Math.min(dt, 0.25);
     while (this._acc >= MATCH_DT - 1e-9) {
       this._acc -= MATCH_DT;
+      this._hitTick = false;
       this._tick(MATCH_DT);
+      if (this._hitTick && this.breakOnHit) break;
     }
+  }
+
+  /** Laufhilfe für menschliche Spieler ändern ('off'|'light'|'strong'). */
+  setAssist(a) {
+    this.assist = a;
+    for (const p of this.players) p.assist = assistOf(a);
   }
 
   /** Alle seit dem letzten Aufruf entstandenen Ereignisse. */
@@ -521,6 +535,7 @@ export class Match {
     });
     this._emit('serve_speed', { player: srv.index, kmh: Math.round(kmh), serveNo: this.serveNo });
     srv.stroke.contact = from; srv.stroke.done = true;
+    this._hitTick = true;
     this._afterLaunch(srv.index);
     this._enter('rally');
   }
@@ -578,15 +593,16 @@ export class Match {
   }
 
   _rallyPlayer(p, h) {
-    const R = this.rally, S = this.state;
+    const R = this.rally;
     const inp = this._cur[p.index];
     const incoming = R.active && !R.decided && R.lastHitter !== p.index && R.lastHitter >= 0;
     const opp = this.players[1 - p.index];
     const pr = this._pressed[p.index];
-    // --- Tastendruck -> wartender Schlag
-    if (pr.any) {
+    const swinging = p.stroke && !p.stroke.done;
+    // --- Tastendruck -> Laden (Powerbalken startet)
+    if (pr.any && !swinging) {
       const oppSwinging = opp.stroke && !opp.stroke.done && R.lastHitter !== p.index;
-      // früher Druck: eigener Ball ist schon über dem Netz -> Schlag vormerken (Aufladung max. 1 s)
+      // früher Druck: eigener Ball ist schon über dem Netz -> Laden beginnt sofort
       const ownOver = R.active && !R.decided && R.lastHitter === p.index && this.ball.pos[2] * p.side < -0.5;
       if (incoming || oppSwinging || ownOver) {
         if (!p.pending) p.pending = { shot: pr.shot, pressTime: this.time, early: !incoming };
@@ -602,47 +618,46 @@ export class Match {
         planIntercept(p, this.time - p.trajLaunch, p.trajLaunch, this._planOpts(p));
       }
     } else if (!incoming && !p.stroke) { p.plan = null; }
-    // --- Aufladen
-    if (p.pending && !p.stroke) p.charge = clamp01((this.time - p.pending.pressTime) / 1.0);
-    // --- Schwung starten
+    // --- Powerbalken: läuft vom Tastendruck bis zum Treffer (dort friert er ein)
+    if (p.pending) p.charge = clamp01((this.time - p.pending.pressTime) / CHARGE.fill);
+    // --- Schwung starten: kurz vor dem Treffer, aus der gehaltenen Ausholpose
     if (incoming && p.pending && p.plan && p.plan.valid && !p.stroke) {
-      const key = strokeKey(p.plan.family, p.plan.hand, p.pending.shot);
-      const W = STROKES[key].windup;
-      const ttc = p.plan.time - this.time;
-      if (ttc <= W + 1e-6) {
-        // Kein Schwung nach hoffnungslosen Bällen (Abstand nach Ausfallschritt deutlich > Reichweite)
-        const d = Math.hypot(p.plan.pos[0] - p.pos[0], p.plan.pos[2] - p.pos[2]);
-        const reachN = p.human ? p.diff.humanReach + 0.25 : 1.15;
-        const hopeless = (d - 2.4 * ttc) > STROKES[key].reach * p.scale * reachN;
-        if (ttc >= 0.09 && !hopeless) this._startStroke(p, key, ttc, W);
-        else p.pending = null;   // zu spät / unerreichbar
+      let key = strokeKey(p.plan.family, p.plan.hand, p.pending.shot);
+      let ttc = p.plan.time - this.time;
+      // Mensch steht nicht für den (späteren) Plan bereit, der Ball kommt aber jetzt in Reichweite: jetzt schwingen
+      if (p.human && ttc > STROKES[key].swing + 1e-6 && this._swingNow(p, key)) {
+        key = strokeKey(p.plan.family, p.plan.hand, p.pending.shot);
+        ttc = p.plan.time - this.time;
       }
+      if (ttc <= STROKES[key].swing + 1e-6) this._startStroke(p, key, ttc);
     }
     // --- Bewegung
-    const S0 = p.stats;
-    if (p.stroke && !p.stroke.done) {
-      // Ausfallschritt zum Treffpunkt
-      const pl = p.stroke.planPos;
-      p.steerTo(h, pl[0], pl[2], 1, p.human ? 0.55 + 0.4 * p.diff.humanAssist : 0.62);
+    const st = p.stroke;
+    if (st && !st.done) {
+      // Ausfallschritt: vom Schwungstart zum Schlagstandort (begrenzt, weich)
+      const u = clamp01((this.time - st.start) / Math.max(1e-3, st.contactTime - st.start)), e = smooth(u);
+      const nx = lerp(st.from[0], st.to[0], e), nz = lerp(st.from[2], st.to[2], e);
+      p.vel[0] = (nx - p.pos[0]) / h; p.vel[2] = (nz - p.pos[2]) / h;
+      p.pos[0] = nx; p.pos[2] = nz;
       p.mode = 'stroke';
-    } else if (p.stroke && p.stroke.done) {
-      // Ausschwung: langsam
-      if (p.human) p.applyMove(h, inp.move[0] * 0.4, inp.move[1] * 0.4);
-      else p.applyMove(h, inp.move[0] * 0.5, inp.move[1] * 0.5);
-      if (this.time >= p.stroke.contactTime + STROKES[p.stroke.type].follow * 0.8) { p.stroke = null; }
+    } else if (st && st.done) {
+      // Ausschwung: langsam (nach einer Rettung noch langsamer)
+      const m = p.recover > 0 ? 0.2 : p.human ? 0.4 : 0.5;
+      p.applyMove(h, inp.move[0] * m, inp.move[1] * m);
+      if (this.time >= st.contactTime + STROKES[st.type].follow * 0.8) { p.stroke = null; }
       p.mode = 'stroke';
     } else {
       let mx = inp.move[0], mz = inp.move[1];
-      let speedMul = 1;
-      if (p.pending && incoming) speedMul = 1 - 0.18 * p.charge;   // Aufladen bremst etwas
-      if (p.human && incoming && p.plan && p.plan.valid) {
-        // Bewegungshilfe: sanft zum idealen Standort
-        const a = p.diff.humanAssist * (p.pending ? 1 : 0.5);
+      let speedMul = p.pending ? CHARGE.moveMul : 1;   // Laden kostet Beweglichkeit
+      if (p.recover > 0) speedMul *= 0.5;
+      if (p.human && incoming && p.plan && p.plan.valid && p.assist > 0) {
+        // Laufhilfe (Einstellung aus/leicht/stark): sanfter Zug zum idealen Standort
+        const a = p.assist * (p.pending ? 1 : 0.6);
         const dx = p.plan.pos[0] - p.pos[0], dz = p.plan.pos[2] - p.pos[2];
         const d = Math.hypot(dx, dz);
         if (d > 0.03) {
           const tl = Math.max(0.05, p.plan.time - this.time);
-          const need = clamp(d / tl / (S0.maxSpeed * speedMul), 0, 1);
+          const need = clamp(d / tl / (p.stats.maxSpeed * speedMul), 0, 1);
           const inMag = Math.hypot(mx, mz);
           const k = a * Math.max(need, Math.min(1, d / 0.7)) * (inMag > 0.2 ? 0.6 : 1);
           mx += (dx / d) * k; mz += (dz / d) * k;
@@ -653,10 +668,55 @@ export class Match {
       const sp = Math.hypot(p.vel[0], p.vel[2]);
       p.mode = sp > 0.5 ? 'move' : 'ready';
     }
+    if (p.recover > 0) p.recover -= h;
     this._tickSplit(p, h);
+    this._updatePreview(p, inp, incoming);
     p.ready = 1;
     if (Math.abs(p.pos[2]) < 6.0) p.wentToNet = true;
     p.atNet = Math.abs(p.pos[2]) < 6.4;
+  }
+
+  /**
+   * Ball ist in Schwungzeit am Spieler vorbei erreichbar (Ausfallschritt), der Plan verlangt aber einen weiten Weg:
+   * Plan auf diesen Treffpunkt umstellen (true). So schwingt ein stehender Mensch mit geladenem Balken am Ball,
+   * statt dass der Plan immer weiter nach hinten wandert.
+   */
+  _swingNow(p, key) {
+    const h = MATCH_DT, plan = p.plan;
+    const reach = lungeOf(p) + hitRadius(p) * 0.5;
+    if (Math.hypot(plan.pos[0] - p.pos[0], plan.pos[2] - p.pos[2]) <= reach) return false;   // steht bereit
+    const tRel = Math.round((this.time + STROKES[key].swing - p.trajLaunch) / h) * h;
+    const c = contactAt(p, tRel, this._planOpts(p), this._ca || (this._ca = { ball: [0, 0, 0], pos: [0, 0, 0] }));
+    if (!c || c.gap > reach) return false;
+    plan.time = p.trajLaunch + tRel; plan.t = tRel;
+    plan.contact[0] = c.ball[0]; plan.contact[1] = c.ball[1]; plan.contact[2] = c.ball[2];
+    plan.pos[0] = c.pos[0]; plan.pos[2] = c.pos[2];
+    plan.family = c.family; plan.hand = c.hand; plan.height = c.ball[1];
+    p._planAge = 0;
+    return true;
+  }
+
+  /** Zielkreis-Vorschau beim Laden (p.preview): erwartete Qualität aus der aktuellen Stellung, Kraft = Balken. */
+  _updatePreview(p, inp, incoming) {
+    const pv = p.preview, st = p.stroke, plan = p.plan;
+    if (!p.pending || !incoming || !plan || !plan.valid || (st && st.done)) { pv.on = false; return; }
+    const q = this._pq || (this._pq = { gap: 0, gapFwd: 0, rescue: false, rushed: false });
+    if (st) { q.gap = st.gap; q.gapFwd = st.gapFwd; q.rescue = st.rescue; q.rushed = st.rushed; }
+    else {
+      const dx = plan.pos[0] - p.pos[0], dz = plan.pos[2] - p.pos[2];
+      q.gap = Math.hypot(dx, dz); q.gapFwd = -dz * p.side; q.rescue = q.gap - lungeOf(p) > hitRadius(p) && plan.family !== 'smash'; q.rushed = false;
+    }
+    const o = this._pvo || (this._pvo = { shot: 'topspin', family: 'ground', power: 0, aim: null, from: null, quality: 'good', runSpeed: 0, incomingSpeed: 0, rescue: false });
+    o.shot = p.pending.shot; o.family = st ? st.family : plan.family;
+    o.power = q.rescue ? Math.min(p.charge, HIT.rescuePower) : p.charge;
+    o.aim = inp.aim; o.from = st ? st.ball : plan.contact;
+    o.quality = strokeQuality(q); o.rescue = q.rescue;
+    o.runSpeed = st ? st.approach : Math.hypot(p.vel[0], p.vel[2]);
+    const bv = st ? st.ballVel : plan.ballVel;
+    o.incomingSpeed = Math.hypot(bv[0], bv[1], bv[2]);
+    previewShot(p, o, pv);
+    pv.quality = o.quality; pv.power = o.power;
+    pv.on = true;
   }
 
   _planOpts(p) {
@@ -675,53 +735,78 @@ export class Match {
     return o;
   }
 
-  _startStroke(p, key, ttc, W) {
-    const plan = p.plan;
-    const rushed = ttc < W - 0.03;
-    const power = p.plan.family === 'volley' ? 0.4 + 0.5 * p.charge : 0.38 + 0.6 * p.charge;
+  /**
+   * Schwung starten (ttc = Zeit bis zum geplanten Treffer). Kontaktzeit liegt auf dem 120-Hz-Raster, damit der Ball beim
+   * Treffer exakt an der vorhergesagten Stelle ist. Ausfallschritt höchstens HIT.lunge; reicht das nicht, Rettung mit
+   * HIT.rescueLunge; hoffnungslose Bälle werden nicht angeschwungen.
+   */
+  _startStroke(p, key, ttc) {
+    const plan = p.plan, S = STROKES[key], h = MATCH_DT;
+    if (ttc < 0.07) { p.pending = null; p.charge = 0; return; }        // zu spät gedrückt
+    const tRel = Math.max(h, Math.round((plan.time - p.trajLaunch) / h) * h);
+    const contactTime = p.trajLaunch + tRel;
+    const ball = p.traj.positionAt(tRel, [0, 0, 0]);
+    const ideal = p.idealPosFor([0, 0, 0], ball[0], ball[2], S.contact);
+    if (ideal[2] * p.side < 0.5) ideal[2] = 0.5 * p.side;
+    const dx = ideal[0] - p.pos[0], dz = ideal[2] - p.pos[2], d = Math.hypot(dx, dz);
+    const R = hitRadius(p);                                   // Reichweite der Figur: Radius und Ausfallschritt
+    let L = lungeOf(p), rescue = false;
+    if (d - L > R) {
+      if (d - lungeOf(p, true) > HIT.whiff) { p.pending = null; p.charge = 0; return; }   // hoffnungslos
+      if (plan.family !== 'smash') { L = lungeOf(p, true); rescue = true; }             // Überkopf: kein Hechtsprung
+    }
+    const k = d > L ? L / d : 1;
+    const to = [p.pos[0] + dx * k, 0, p.pos[2] + dz * k];
+    // Schlägerpunkt am Ende des Ausfallschritts: Fehlschlag schon jetzt absehbar -> Figur schwingt sichtbar vorbei
+    const rp = strokeContactWorld([0, 0, 0], to, p.netYaw, S.contact, p.scale);
+    const miss = Math.hypot(ball[0] - rp[0], ball[2] - rp[2]) > R;
+    if (miss) rp[1] = clamp(ball[1], S.height[0] * p.scale, S.height[1] * p.scale);
+    const contact = miss ? rp : ball;
+    const rushed = ttc < S.swing - 0.03;
     p.stroke = {
-      type: key, shot: p.pending.shot, hand: plan.hand, family: plan.family, start: this.time, windup: ttc, contactTime: plan.time,
-      contact: [plan.contact[0], plan.contact[1], plan.contact[2]], planPos: this._strokeStandPos(p, plan), power, rushed, done: false,
-      charge: p.charge, slack: plan.slack, feasible: plan.feasible, ballVel: plan.ballVel.slice(),
+      type: key, shot: p.pending.shot, hand: plan.hand, family: plan.family, start: this.time, windup: ttc, contactTime,
+      contact, ball, from: [p.pos[0], 0, p.pos[2]], to, planPos: to, rushed, rescue, miss, gap: d, gapFwd: -dz * p.side,
+      approach: Math.hypot(p.vel[0], p.vel[2]), power: p.charge, pressTime: p.pending.pressTime, done: false,
+      slack: plan.slack, feasible: plan.feasible, ballVel: plan.ballVel.slice(),
     };
     p.mode = 'stroke';
-    this._emit('stroke_start', { player: p.index, stroke: key, shot: p.pending.shot, windup: ttc, contact: p.stroke.contact, contactTime: plan.time, power, hand: plan.hand, family: plan.family, rushed });
+    this._emit('stroke_start', {
+      player: p.index, stroke: key, shot: p.pending.shot, windup: ttc, contact: contact.slice(), contactTime, power: p.charge,
+      charge: p.charge, hand: plan.hand, family: plan.family, rushed, rescue, miss,
+    });
     // Gegner: Split-Step zum Treffzeitpunkt
-    this._scheduleSplit(this.players[1 - p.index], plan.time);
-  }
-
-  /** Standort, zu dem der Spieler während des Ausholens noch einen Ausfallschritt macht. */
-  _strokeStandPos(p, plan) {
-    const ai = this.ai[p.index];
-    if (ai && ai.standPos) return [ai.standPos[0], 0, ai.standPos[2]];
-    return [plan.pos[0], 0, plan.pos[2]];
+    this._scheduleSplit(this.players[1 - p.index], contactTime);
   }
 
   _strokeContact(p) {
     const R = this.rally, S = this.state;
     const st = p.stroke;
     st.done = true;
+    const charge = p.charge = clamp01((this.time - st.pressTime) / CHARGE.fill);   // Balken friert hier ein
     p.pending = null;
     if (R.decided || R.lastHitter === p.index || this.ball.mode !== 'air') { p.charge = 0; return; }
-    const q = contactQuality(p, this.ball.pos, st.type, st.rushed, st.charge, _q);
+    const q = contactQuality(p, this.ball.pos, st.type, st, _q);
     if (q.miss) {
-      this._emit('miss', { player: p.index, pos: [this.ball.pos[0], this.ball.pos[1], this.ball.pos[2]] });
+      this._emit('miss', { player: p.index, pos: [this.ball.pos[0], this.ball.pos[1], this.ball.pos[2]], err: q.err, rescue: st.rescue });
       p.charge = 0;
       if (R.isServe) R.receiverTouched = false;
       p.missed = true;
+      if (st.rescue) p.recover = 0.5;
       return;
     }
-    // Schlag ausführen
+    // Schlag ausführen: Kraft = Balkenwert (Rettung: schwach)
     const inp = this._cur[p.index];
     const inSpeed = Math.hypot(this.ball.vel[0], this.ball.vel[1], this.ball.vel[2]);
     const inRpm = Math.hypot(this.ball.spin[0], this.ball.spin[1], this.ball.spin[2]) / RPM;
-    const runSpeed = Math.hypot(p.vel[0], p.vel[2]);
-    let shot = st.shot;
+    const runSpeed = st.approach;
+    const power = st.rescue ? Math.min(charge, HIT.rescuePower) : charge;
+    st.power = power;
+    if (st.rescue) p.recover = 0.45;
+    const shot = st.shot;
     const from = [this.ball.pos[0], this.ball.pos[1], this.ball.pos[2]];
-    const target = null;
     const res = resolveShot({
-      p, rng: this.rng, shot, family: st.family, key: st.type, from, aim: inp.aim, target,
-      quality: q.quality, charge: st.charge, incomingSpeed: inSpeed, incomingRpm: inRpm, runSpeed, errMul: this._errMul(p),
+      p, rng: this.rng, shot, family: st.family, key: st.type, from, aim: inp.aim, target: null,
+      quality: q.quality, power, incomingSpeed: inSpeed, runSpeed, rescue: st.rescue,
     }, _shot);
     const wasServe = R.isServe;
     this.ball.launch(from, res.vel, res.spin);
@@ -734,22 +819,26 @@ export class Match {
     pressure += clamp((runSpeed - 2.2) / 3, 0, 1) * 0.25;
     if (from[1] < 0.42 * p.scale || from[1] > 1.65 * p.scale) pressure += 0.15;
     if (wasServe && inSpeed > 35) pressure += 0.3;
+    if (st.rescue) pressure += 0.4;
     R.lastHitter = p.index; R.isServe = false; R.hits++; R.bounces = 0; R.firstBounce = null; R.netTouched = false;
     R.launchTime = this.time; R.shotId++; R.closeCall = null;
     if (wasServe) R.receiverTouched = true;
     R.lastShot = {
       player: p.index, type: st.type, shot, family: st.family, quality: q.quality, speed: res.speed, kmh: res.speed * 3.6,
       target: { x: res.aimTarget.x, z: res.aimTarget.z }, pressure, preset: res.preset, time: this.time, returnOfServe: wasServe,
-      height: from[1], charge: st.charge,
+      height: from[1], charge: power, radius: res.radius, rescue: st.rescue,
     };
     p.lastHit = R.lastShot;
     if (st.family === 'volley' || st.family === 'smash') p.wentToNet = true;
     S.rally = R.hits; S.lastHitter = p.index; S.lastHitTime = this.time; S.shotId = R.shotId; S.lastShot = R.lastShot;
     S.target = R.lastShot.target;
     p.charge = 0;
+    this._hitTick = true;
     this._emit('hit', {
       player: p.index, stroke: st.type, shot, quality: q.quality, speed: res.speed, kmh: res.speed * 3.6, spin: res.rpm, pos: from,
-      target: { x: res.aimTarget.x, z: res.aimTarget.z }, family: st.family, power: res.power, serve: false, rally: R.hits, clearance: res.clearance,
+      target: { x: res.aimTarget.x, z: res.aimTarget.z }, landing: { x: res.target.x, z: res.target.z }, radius: res.radius, red: res.red,
+      netDump: res.netDump, family: st.family, power, bar: charge, pressTime: st.pressTime, serve: false, rally: R.hits, clearance: res.clearance,
+      rescue: st.rescue, err: q.err, strong: st.family === 'smash' || (power >= 0.7 && (q.quality === 'perfect' || q.quality === 'good')),
     });
     this._afterLaunch(p.index);
   }

@@ -1,9 +1,9 @@
 // Spieler: Zustand, Bewegung (Beschleunigung/Bremsen aus PLAYER_STATS), Abfangplanung
 // (Treffpunkt-Kandidaten entlang der Ballvorhersage), Zielwahl aus der Eingabe und Schlagausführung
-// (Fehlermodell + Schlag-Löser). Reine Logik, deterministisch (Rng), node-testbar.
+// (sichtbarer Zielkreis + Schlag-Löser, kein verdeckter Würfel). Reine Logik, deterministisch (Rng), node-testbar.
 
 import { COURT } from '../sim/court.js';
-import { STROKES, SHOT_TO_STROKE, PLAYER_STATS, strokeContactWorld } from '../sim/strokes.js';
+import { STROKES, SHOT_TO_STROKE, PLAYER_STATS, HIT, RISK, strokeContactWorld } from '../sim/strokes.js';
 import { Trajectory, RPM } from '../sim/ball.js';
 import { solveShot, presetParams } from '../sim/shot.js';
 
@@ -41,31 +41,38 @@ export class Rng {
 }
 
 // ---------------------------------------------------------------- Schwierigkeit
-// human*: Werte für menschlich gesteuerte Spieler; ai*: für KI-Spieler (siehe ai.js).
+// human*: Werte für menschlich gesteuerte Spieler (nur noch Aufschlag); ai*: für KI-Spieler (siehe ai.js).
+// aiError wirkt nur noch auf den Aufschlag: Im Ballwechsel nutzt die KI denselben Zielkreis wie der Mensch.
+// aiKeep: Risikobereitschaft – Abstand der Kreismitte zur Linie in Kreisradien (1 = Kreis ganz im Feld).
+// aiPower: gewünschte Kraft (Powerbalken 0..1, Bereich), je nach Lage und Laufweg weniger.
 export const DIFFICULTY = {
   easy: {
     name: 'easy',
-    humanError: 0.72, humanAssist: 0.85, humanReach: 1.35,
-    aiError: 1.1, aiReaction: 0.3, aiRead: 0.15, aiAnticipate: 0.5, aiSpeed: 0.84, aiAggression: 0.25, aiChargeLead: [0.25, 0.6],
+    humanError: 0.72,
+    aiError: 1.1, aiReaction: 0.3, aiRead: 0.15, aiAnticipate: 0.5, aiSpeed: 0.84, aiAggression: 0.25, aiPower: [0.25, 0.6],
     aiServeSigma: 0.07, aiNetRush: 0.04, aiSmart: 0.35, aiDrop: 0.03, aiLatePress: 0.08,
-    aiServePower: [0.45, 0.75], aiMargin: 1.05, aiFhBias: 0.10, aiPosErr: 0.42,
+    aiServePower: [0.45, 0.75], aiMargin: 1.05, aiFhBias: 0.10, aiPosErr: 0.42, aiKeep: 0.55,
   },
   normal: {
     name: 'normal',
-    humanError: 0.85, humanAssist: 0.62, humanReach: 1.22,
-    aiError: 1.0, aiReaction: 0.22, aiRead: 0.35, aiAnticipate: 0.8, aiSpeed: 0.93, aiAggression: 0.5, aiChargeLead: [0.45, 0.85],
+    humanError: 0.85,
+    aiError: 1.0, aiReaction: 0.22, aiRead: 0.35, aiAnticipate: 0.8, aiSpeed: 0.93, aiAggression: 0.5, aiPower: [0.45, 0.85],
     aiServeSigma: 0.045, aiNetRush: 0.14, aiSmart: 0.72, aiDrop: 0.06, aiLatePress: 0.02,
-    aiServePower: [0.6, 0.9], aiMargin: 0.8, aiFhBias: 0.22, aiPosErr: 0.28,
+    aiServePower: [0.6, 0.9], aiMargin: 0.8, aiFhBias: 0.22, aiPosErr: 0.28, aiKeep: 0.85,
   },
   hard: {
     name: 'hard',
-    humanError: 0.92, humanAssist: 0.45, humanReach: 1.12,
-    aiError: 0.86, aiReaction: 0.15, aiRead: 0.55, aiAnticipate: 0.9, aiSpeed: 1.0, aiAggression: 0.66, aiChargeLead: [0.6, 1.0],
+    humanError: 0.92,
+    aiError: 0.86, aiReaction: 0.15, aiRead: 0.55, aiAnticipate: 0.9, aiSpeed: 1.0, aiAggression: 0.66, aiPower: [0.6, 1.0],
     aiServeSigma: 0.028, aiNetRush: 0.24, aiSmart: 1.0, aiDrop: 0.08, aiLatePress: 0.0,
-    aiServePower: [0.72, 1.0], aiMargin: 0.62, aiFhBias: 0.45, aiPosErr: 0.18,
+    aiServePower: [0.72, 1.0], aiMargin: 0.62, aiFhBias: 0.45, aiPosErr: 0.18, aiKeep: 1.05,
   },
 };
 export const difficultyOf = (d) => DIFFICULTY[d] || DIFFICULTY.normal;
+
+/** Laufhilfe für menschliche Spieler (Einstellung, unabhängig vom Gegner): Zug zum idealen Standort. */
+export const ASSIST = { off: 0, light: 0.3, strong: 0.7 };
+export const assistOf = (a) => (typeof a === 'number' ? a : ASSIST[a] ?? ASSIST.light);
 
 // ---------------------------------------------------------------- Zielwahl aus aim (lr, depth)
 // Tiefe = Abstand des Ziels vom Netz (m) für aim.depth = -1 / 0 / +1 je Schlagart.
@@ -122,6 +129,7 @@ export class Player {
     this.scale = this.stats.reachScale || 1;
     this.human = !!opts.human;
     this.diff = difficultyOf(opts.difficulty);
+    this.assist = assistOf(opts.assist);
     // --- öffentlicher Zustand (PlayerState, ARCHITECTURE §7)
     this.pos = [0, 0, 0];
     this.vel = [0, 0, 0];
@@ -130,7 +138,7 @@ export class Player {
     this.mode = 'idle';            // 'idle'|'walk'|'ready'|'move'|'stroke'|'serve'|'recover'|'emote'
     this.stroke = null;            // { type, shot, hand, start, windup, contactTime, contact:[x,y,z], power, rushed }
     this.emote = null;             // Emote-Vorschlag (character.playEmote)
-    this.charge = 0;               // 0..1 (Aufladung der gedrückten Schlagtaste)
+    this.charge = 0;               // 0..1 Powerbalken (ab Tastendruck, friert beim Treffer ein; Kraft = dieser Wert)
     this.chargeShot = null;        // gewählte Schlagart während des Aufladens
     this.serveMeter = null;        // 0..1 während des Aufschlags (UI), sonst null
     this.serveMeterLocked = false;
@@ -142,6 +150,8 @@ export class Player {
     this.netMode = false;          // KI/Taktik: Netzangriff
     this.plan = null;              // aktueller Abfangplan (siehe planIntercept) oder null
     this.lastHit = null;           // { quality, shot, type, time, pressure }
+    this.preview = { on: false, x: 0, z: 0, r: 0, red: false, net: false, quality: 'good' };   // Zielkreis beim Laden
+    this.recover = 0;              // > 0: nach einem Rettungsschlag (s), langsamer
     // --- intern
     this.pending = null;           // { shot, pressTime }
     this._plan = makePlan();
@@ -165,6 +175,7 @@ export class Player {
     this.serveMeter = null; this.serveMeterLocked = false; this.servePhase = null;
     this.wentToNet = false; this.missed = false; this.splitAt = null; this.atNet = false;
     this.predBounceIn = true; this.predBounce = null;
+    this.preview.on = false; this.recover = 0;
   }
 
   /**
@@ -386,94 +397,185 @@ export function planIntercept(p, tRel, launchTime, o) {
 }
 const BNC = { t: 0, pos: new Float64Array(3), vel: new Float64Array(3), velIn: new Float64Array(3) };
 
-// ---------------------------------------------------------------- Schlagausführung
-/** Kontaktqualität aus Abweichung Ball <-> Schlägerpunkt. Liefert { quality, errN, fwd, lat, up, miss }. */
-export function contactQuality(p, ballPos, key, rushed, charge, out = {}) {
-  const S = STROKES[key];
-  p.racketPoint(TMP, S.contact);
-  const s = p.side;
-  const ex = ballPos[0] - TMP[0], ey = ballPos[1] - TMP[1], ez = ballPos[2] - TMP[2];
-  const reach = S.reach * p.scale;
-  // Rahmen: right = s·X, forward = -s·Z
-  out.lat = ex * s; out.fwd = -ez * s; out.up = ey;
-  const err = Math.hypot(ex, ey * 0.8, ez);
-  out.errN = err / reach;
-  out.miss = out.errN > (p.human ? p.diff.humanReach : 1.12);
-  let q;
-  if (out.errN > 0.92) q = 'frame';
-  else if (rushed) q = 'late';
-  else if (out.errN > 0.5) q = 'stretch';
-  else if (out.fwd > 0.36 * reach) q = 'early';
-  else if (out.fwd < -0.36 * reach) q = 'late';
-  else if (out.errN < 0.2 && charge >= 0.3) q = 'perfect';
-  else q = 'good';
-  out.quality = q;
+/**
+ * Treffpunkt zur Bahnzeit tRel (s seit Abflug): Schlagfamilie/Hand nach denselben Regeln wie planIntercept, idealer
+ * Standort und Abstand des Spielers dorthin. Für "jetzt zuschlagen, der Ball ist da" (Mensch, der nicht für den Plan
+ * bereitsteht). o wie bei planIntercept. Liefert out = { family, hand, ball:[x,y,z], pos:[x,y,z], gap } oder null.
+ */
+export function contactAt(p, tRel, o, out) {
+  const tr = p.traj, s = p.side, k = p.scale;
+  if (!p.trajValid || tr.count < 2) return null;
+  const tb0 = tr.bounceTime(0);
+  if (tb0 >= 0) {
+    const b = tr.bounce(0, BNC);
+    if (b.pos[2] * s < 0) return null;
+    const tb1 = tr.bounceTime(1);
+    if (tb1 >= 0 && tRel >= tb1) return null;
+  }
+  const ball = tr.positionAt(tRel, out.ball);
+  const bz = ball[2] * s;
+  if (bz < 0.35) return null;
+  const pre = tb0 < 0 || tRel < tb0;
+  if (!pre && o.bounceIn === false) return null;
+  const hgt = ball[1];
+  let fam = null;
+  if (pre) {
+    if (o.serveReturn) return null;
+    if (hgt >= H_SMASH[0] * k && hgt <= H_SMASH[1] * k && bz < HL - 0.5 && (o.allowVolley || bz > HL - 3.5)) fam = 'smash';
+    else if (o.allowVolley && hgt >= H_VOLLEY[0] * k && hgt <= H_VOLLEY[1] * k && bz <= (o.volleyZ ?? COURT.serviceLineZ + 2.6)) fam = 'volley';
+  } else if (hgt >= H_GROUND[0] * k && hgt <= H_GROUND[1] * k) fam = 'ground';
+  else if (hgt >= H_SMASH[0] * k && hgt <= H_SMASH[1] * k && !o.serveReturn) fam = 'smash';
+  if (!fam) return null;
+  const hand = fam === 'smash' ? 'fh' : (ball[0] - p.pos[0]) * s > -(o.fhBias ?? 0.15) ? 'fh' : 'bh';
+  p.idealPosFor(out.pos, ball[0], ball[2], contactOffset(fam, hand));
+  if (out.pos[2] * s < 0.5) out.pos[2] = 0.5 * s;
+  out.family = fam; out.hand = hand;
+  out.gap = Math.hypot(out.pos[0] - p.pos[0], out.pos[2] - p.pos[2]);
   return out;
 }
 
-const Q_ERR = { perfect: 0.6, good: 1.0, early: 1.3, late: 1.6, stretch: 1.8, frame: 3.5 };
-const Q_POW = { perfect: 0.08, good: 0, early: -0.06, late: -0.22, stretch: -0.18, frame: -0.42 };
+// ---------------------------------------------------------------- Schlagausführung
+/**
+ * Treffer am Kontakt. Treffer/Fehlschlag entscheidet allein der Abstand Ball <-> Schlägerpunkt nach dem Ausfallschritt
+ * (HIT.radius; Höhe zählt nur außerhalb des Schlagfensters). Die Qualität kommt aus der Stellung beim Schwungstart
+ * (st.gap = Abstand zum idealen Standort, st.gapFwd = Anteil nach vorn) bzw. aus zu spätem Drücken (st.rushed).
+ * Liefert { quality, err, errN, lat, fwd, up, miss }.
+ */
+export function contactQuality(p, ballPos, key, st, out = {}) {
+  const S = STROKES[key];
+  p.racketPoint(TMP, S.contact);
+  const s = p.side, k = p.scale;
+  const ex = ballPos[0] - TMP[0], ey = ballPos[1] - TMP[1], ez = ballPos[2] - TMP[2];
+  // Rahmen: right = s·X, forward = -s·Z
+  out.lat = ex * s; out.fwd = -ez * s; out.up = ey;
+  const h = ballPos[1], H = S.height;
+  const ev = Math.max(0, h - H[1] * k, H[0] * k - h);
+  out.err = Math.hypot(out.lat, out.fwd, ev);
+  const R = hitRadius(p);
+  out.errN = out.err / R;
+  out.miss = out.err > R;
+  out.quality = strokeQuality(st, out.errN);
+  return out;
+}
+
+/** Trefferradius der Figur (HIT.radius bei reachScale = HIT.refScale, kleinere Figuren etwas weniger). */
+export const hitRadius = (p) => HIT.radius * Math.min(1, p.scale / HIT.refScale);
+/** Ausfallschritt der Figur (normal / Rettung), skaliert mit der Reichweite. */
+export const lungeOf = (p, rescue = false) => (rescue ? HIT.rescueLunge : HIT.lunge) * p.scale / HIT.refScale;
+
+/** Qualität aus Stellung beim Schwungstart (gap, gapFwd), Rettung und spätem Drücken; errN = Restfehler / Radius. */
+export function strokeQuality(st, errN = 0) {
+  if (errN > 0.8) return 'frame';
+  if (st.rescue) return 'stretch';
+  if (st.rushed) return 'late';
+  const g = st.gap || 0;
+  if (g <= HIT.perfect) return 'perfect';
+  if (g > HIT.good) return 'stretch';
+  const f = st.gapFwd || 0;
+  if (f > 0.3) return 'late';      // Ball kam näher als gedacht: zu weit hinten gestanden
+  if (f < -0.3) return 'early';    // zu nah dran / überlaufen
+  return 'good';
+}
+
+/** Kurzform der Schlagart für Ziel/Löser (Familie + Taste). */
+export function shotPreset(fam, shot) {
+  if (fam === 'smash') return 'smash';
+  if (fam === 'volley') return shot === 'drop' ? 'drop' : shot === 'lob' ? 'lob' : 'volley';
+  return shot === 'flat' ? 'flat' : shot;
+}
+const aimShotOf = (fam, preset) => (fam === 'smash' ? 'smash' : fam === 'volley' && preset === 'volley' ? 'volley' : preset);
+
+/**
+ * Radius des Zielkreises (m) – das ganze Risiko eines Schlags, für Mensch und KI gleich.
+ * lr/depth = Richtungseingabe (-1..1, depth > 0 = nach vorn/tief), runSpeed = Laufgeschwindigkeit beim Schlag (m/s).
+ */
+export function spreadRadius(p, preset, fam, power, lr, depth, quality, runSpeed = 0, incomingSpeed = 0, rescue = false) {
+  const st = p.stats;
+  let r = RISK.base + RISK.power * Math.pow(clamp01(power), RISK.powerExp) + RISK.depth * Math.max(0, depth)
+    + RISK.angle * Math.abs(clamp(lr, -1, 1)) + RISK.run * runSpeed;
+  r *= RISK.quality[quality] ?? 1;
+  r *= 1.25 - 0.35 * (st.control ?? 0.8);
+  if (preset === 'drop' || preset === 'lob') r *= 1.2 - 0.3 * (st.touch ?? 0.8);
+  if (fam === 'volley') r *= 1.15 - 0.25 * (st.volley ?? 0.8);
+  r *= 1 + Math.max(0, incomingSpeed - 20) / 50;
+  if (rescue) r *= RISK.rescue;
+  return Math.min(r, RISK.maxRadius);
+}
+
+/** Reicht der Kreis (Mitte x/z, Radius r) auf der Gegnerseite des Schlagenden (side) über eine Linie? */
+export function circleRed(side, x, z, r) {
+  const d = -side * z;                                    // Abstand vom Netz auf der Gegnerseite
+  return Math.abs(x) + r > SW || d + r > HL || d - r < 0.3;
+}
+
+/** Netzfehler (sichtbar begründet): sehr tiefer Ball und fast volle Kraft bei Grundschlag/Volley. */
+export function netRiskOf(p, preset, fam, power, h) {
+  if (preset === 'lob' || fam === 'smash') return false;
+  return h / p.scale < RISK.lowBall && power >= RISK.netPower;
+}
+
+/**
+ * Zielkreis ohne Ausführung (Anzeige beim Laden, Entscheidungen der KI).
+ * o = { shot, family, power, aim:[lr, depth], from:[x,y,z] (Treffpunkt), quality, runSpeed, incomingSpeed, rescue }
+ * Ergebnis out = { x, z, r, red, net, preset }.
+ */
+export function previewShot(p, o, out = {}) {
+  const preset = shotPreset(o.family, o.shot);
+  const lr = o.aim ? clamp(o.aim[0], -1, 1) : 0, dp = o.aim ? clamp(o.aim[1], -1, 1) : 0;
+  aimToTarget(p.side, o.from[0], lr, dp, aimShotOf(o.family, preset), out);
+  out.r = spreadRadius(p, preset, o.family, o.power, lr, dp, o.quality || 'good', o.runSpeed || 0, o.incomingSpeed || 0, !!o.rescue);
+  out.red = circleRed(p.side, out.x, out.z, out.r);
+  out.net = netRiskOf(p, preset, o.family, o.power, o.from[1]);
+  out.preset = preset;
+  return out;
+}
 
 const _sol = { requested: {}, landing: {}, vel: new Float64Array(3), spin: new Float64Array(3) };
 const _pp = {}, _spinReq = { top: 0, side: 0, rifle: 0 };
-/** Grundwahrscheinlichkeit eines Netzfehlers je Kontaktqualität. */
-export const P_DUMP = { perfect: 0.004, good: 0.02, early: 0.04, late: 0.07, stretch: 0.09, frame: 0.35 };
 
 /**
  * Schlag berechnen. req = { p, rng, shot, family, key, from:[x,y,z], aim:[lr, depth] | null, target:{x,z} | null,
- *   quality, charge, incomingSpeed, incomingRpm, runSpeed, errMul, serve:{serverSide, box} | null, powerOverride }
- * Liefert { ok, vel, spin, speed, rpm, target:{x,z}, aimTarget:{x,z}, power, preset }.
+ *   quality, power, incomingSpeed, runSpeed, rescue }
+ * Kraft = req.power (exakt der Balkenwert). Der Ball landet gleichverteilt im Zielkreis (Mitte = Zielpunkt aus der
+ * Richtung, Radius = spreadRadius). Richtung nach vorn = härter/flacher/tiefer, nach hinten = kürzer/höher.
+ * Netzfehler nur bei netRiskOf (tiefer Ball + volle Kraft).
+ * Liefert { ok, vel, spin, speed, rpm, target:{x,z} (Landepunkt), aimTarget:{x,z} (Kreismitte), radius, red, power, preset, netDump }.
  */
 export function resolveShot(req, out = {}) {
   const { p, rng } = req;
   const st = p.stats;
-  const shot = req.shot;
   const fam = req.family;
-  let preset;
-  if (fam === 'smash') preset = 'smash';
-  else if (fam === 'volley') preset = shot === 'drop' ? 'drop' : shot === 'lob' ? 'lob' : 'volley';
-  else preset = shot === 'flat' ? 'flat' : shot;
-  const aimShot = fam === 'smash' ? 'smash' : fam === 'volley' && preset === 'volley' ? 'volley' : preset;
-  // --- Ziel
+  const preset = shotPreset(fam, req.shot);
+  const lr = req.aim ? clamp(req.aim[0], -1, 1) : 0, dp = req.aim ? clamp(req.aim[1], -1, 1) : 0;
+  // --- Kreismitte
   const tgt = out.aimTarget || (out.aimTarget = {});
   if (req.target) { tgt.x = req.target.x; tgt.z = req.target.z; }
-  else aimToTarget(p.side, req.from[0], req.aim ? req.aim[0] : 0, req.aim ? req.aim[1] : 0, aimShot, tgt);
-  // --- Kraft
-  const q = req.quality || 'good';
-  const charge = clamp01(req.charge || 0);
-  let power = req.powerOverride ?? (fam === 'volley' ? 0.4 + 0.5 * charge : 0.38 + 0.6 * charge);
-  power = clamp(power + Q_POW[q], 0.05, 1);
-  // tiefe/hohe Bälle können nicht voll geschlagen werden
+  else aimToTarget(p.side, req.from[0], lr, dp, aimShotOf(fam, preset), tgt);
+  // --- Kraft (exakt)
+  const power = clamp01(req.power ?? 0.5);
   const h = req.from[1];
-  if (fam === 'ground' && (preset === 'topspin' || preset === 'flat')) {
-    if (h < 0.6) power *= 0.8 + 0.33 * h;
-  }
-  // --- Fehlermodell
-  let sig = 0.55 * (Q_ERR[q] || 1);
-  sig *= 1.28 - 0.55 * (st.control ?? 0.8);
-  sig *= 1.15 - 0.35 * charge;
-  sig *= 1 + Math.max(0, (req.incomingSpeed || 0) - 20) / 28 + Math.abs(req.incomingRpm || 0) / 7000;
-  sig *= 1 + 0.07 * (req.runSpeed || 0);
-  sig *= 1 + 0.7 * Math.max(0, power - 0.6);
-  if (preset === 'drop' || preset === 'lob') sig *= 1.25 - 0.4 * (st.touch ?? 0.8);
-  if (fam === 'volley') sig *= 1.2 - 0.35 * (st.volley ?? 0.8);
-  if (fam === 'ground') {
-    const hk = h / p.scale;
-    sig *= 1 + 0.9 * Math.max(0, 0.55 - hk) + 0.5 * Math.max(0, hk - 1.35);
-  }
-  sig *= req.errMul ?? 1;
-  const ex = rng.gaussC(2.6) * sig * 0.7, ez = rng.gaussC(2.6) * sig * (preset === 'drop' ? 0.6 : 1.3);
-  let tgz = tgt.z + ez;
-  if (tgz * -p.side < 0.6) tgz = -p.side * 0.6;            // Ziel bleibt auf der Gegenseite
+  // --- Zielkreis + Landepunkt (gleichverteilt im Kreis)
+  const q = req.quality || 'good';
+  const r = spreadRadius(p, preset, fam, power, lr, dp, q, req.runSpeed || 0, req.incomingSpeed || 0, !!req.rescue);
+  const u = rng.next(), a = rng.next() * 2 * Math.PI, rr = r * Math.sqrt(u);
   const target = out.target || (out.target = {});
-  target.x = tgt.x + ex; target.z = tgz;
-  // --- Lösen. Topspin: hoher Treffpunkt + Aufladung -> flacher, schneller Drive (Rasen), tiefer Ball -> mehr Spin.
+  target.x = tgt.x + rr * Math.cos(a);
+  let tz = tgt.z + rr * Math.sin(a);
+  if (tz * -p.side < 0.6) tz = -p.side * 0.6;               // Landepunkt bleibt auf der Gegenseite
+  target.z = tz;
+  // --- Lösen
   let sol, flat = 0;
-  if (preset === 'topspin') {
+  if (preset === 'topspin' || preset === 'flat') {
+    // Kraft + Richtung vorn -> flacher, schneller Drive; Richtung hinten -> höherer, sicherer Bogen
     const pp = presetParams('topspin', power, st, _pp);
-    flat = clamp((charge - 0.45) * 1.1 + (h / p.scale - 0.85) * 0.9, 0, 0.75) * (Q_POW[q] < -0.1 ? 0.3 : 1);
-    _spinReq.top = pp.topRpm * (1 - 0.5 * flat); _spinReq.side = 0; _spinReq.rifle = 0;
-    sol = solveShot({ from: req.from, target, spin: _spinReq, speed: pp.speed * (1 + 0.1 * flat), minClearance: 0.12 }, _sol);
+    flat = clamp(0.72 * power + 0.3 * Math.max(0, dp) - 0.2 * Math.max(0, -dp) - 0.12 + (h / p.scale - 0.85) * 0.5 + (preset === 'flat' ? 0.25 : 0), 0, 0.85);
+    _spinReq.top = pp.topRpm * (1 - 0.6 * flat); _spinReq.side = 0; _spinReq.rifle = 0;
+    const speed = lerp(12.5, 30 * (0.7 + 0.35 * (st.power ?? 0.8)), power) * (1 + 0.1 * dp);
+    sol = solveShot({ from: req.from, target, spin: _spinReq, speed, minClearance: 0.2 - 0.12 * flat }, _sol);
+  } else if (preset === 'slice') {
+    const pp = presetParams('slice', power, st, _pp);
+    const clr = pp.netClearance * (1 - 0.3 * Math.max(0, dp)) + 0.3 * Math.max(0, -dp);
+    sol = solveShot({ from: req.from, target, spin: 'slice', power, stats: st, netClearance: clr }, _sol);
   } else {
     sol = solveShot({ from: req.from, target, spin: preset, power, stats: st }, _sol);
   }
@@ -482,29 +584,21 @@ export function resolveShot(req, out = {}) {
   out.clearance = sol.netClearance;
   out.power = power;
   out.flat = flat;
+  out.radius = r;
+  out.red = circleRed(p.side, tgt.x, tgt.z, r);
   const vel = out.vel || (out.vel = new Float64Array(3));
   const spin = out.spin || (out.spin = new Float64Array(3));
   vel.set(sol.vel); spin.set(sol.spin);
-  // Schlägerwinkel-Fehler: Richtung/Länge (klein) + "ins Netz gezogen" (nur nach unten, abhängig von Höhe/Druck)
-  const angSig = sig * 0.004 * (preset === 'lob' ? 0.6 : 1);
-  rotateVel(vel, rng.gaussC(2.6) * angSig, rng.gaussC(2.6) * angSig * 0.5);
-  // Netzfehler: explizite Wahrscheinlichkeit (Qualität, tiefer Ball, flacher Drive, Tempo des ankommenden Balls)
-  const dn = Math.abs(req.from[2]);
+  // Netzfehler: tiefer Ball voll durchgezogen -> ins Netz (Treffhöhe knapp unter dem Band)
   out.netDump = false;
-  if (dn > 0.8 && preset !== 'lob' && Number.isFinite(sol.netClearance)) {
-    let pn = (P_DUMP[q] ?? 0.015) * (1 + 2.0 * Math.max(0, 0.8 - h / p.scale)) * (1 + 1.2 * flat);
-    pn *= (preset === 'drop' ? 2 : 1) * (fam === 'volley' ? 1.4 : 1) * (1.3 - 0.45 * (st.control ?? 0.8));
-    pn *= (1 + Math.max(0, (req.incomingSpeed || 0) - 20) / 25) * (req.errMul ?? 1);
-    if (rng.next() < pn) {
-      // Ball ins Netz (Treffhöhe zwischen knapp unter dem Band und Netzmitte)
-      const want = -rng.range(0.05, 0.45);
-      rotateVel(vel, (want - sol.netClearance) / dn, 0);
-      out.netDump = true;
-    }
+  const dn = Math.abs(req.from[2]);
+  if (netRiskOf(p, preset, fam, power, h) && dn > 0.8 && Number.isFinite(sol.netClearance)) {
+    const want = -0.18 - 0.1 * (1 - h / p.scale / RISK.lowBall);
+    rotateVel(vel, (want - sol.netClearance) / dn, 0);
+    out.netDump = true;
   }
   out.speed = Math.hypot(vel[0], vel[1], vel[2]);
   out.rpm = Math.hypot(spin[0], spin[1], spin[2]) / RPM;
-  out.sigma = sig;
   return out;
 }
 

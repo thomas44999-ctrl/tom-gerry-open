@@ -3,7 +3,9 @@
 //
 //   const c = new Character(renderer, asset, racket);      // renderer darf null sein (Node-Tests, keine Drawables)
 //   c.position, c.yaw; c.setLocomotion(velWorld, ready, { split })
-//   c.playStroke(type, { timeToContact, contactWorld, shot, power }); c.playServe(phase, opts); c.playEmote(name)
+//   c.setCharge(v 0..1 | null, { stroke, shot })   Ausholpose ab Tastendruck (Weite = Powerbalken)
+//   c.playStroke(type, { timeToContact, contactWorld, shot, power, lunge }); c.playServe(phase, opts); c.playEmote(name)
+//   c.alignContact(pos, dtNext)   Kontakt exakt auf das Ende des nächsten Bildes legen (Treffpunkt = echte Ballposition)
 //   c.lookAt(pos|null); c.update(dt); c.drawables; c.events (pro update neu befüllt)
 //   c.getRacketSweetSpot(out); c.getHandPos('l'|'r', out); c.heldBallPos(out); c.capturePose(); c.applyCapturedPose(a)
 //
@@ -187,8 +189,9 @@ export class Character {
     this._ikPos = new Float32Array(3);
     this._ikW = 0;
 
-    // Aktion (Schlag/Aufschlag/Emote) + ausblendende Vorgänger-Pose
+    // Aktion (Schlag/Aufschlag/Emote/Ausholen) + ausblendende Vorgänger-Pose
     this.action = null;
+    this.chargeIn = null;          // { v, type, shot } aus setCharge (Spiellogik -> Figur)
     this.prevW = 0;
     this.serve = { phase: 'none', t: 0, period: 0.62, catchT: 0, released: false, v0: 0, spot: new Float32Array(3), release: 0, caught: false };
     this.ballInHand = false;
@@ -310,17 +313,36 @@ export class Character {
   }
 
   /**
+   * Ausholen (Laden): v 0..1 = Powerbalken, null = aus. o = { stroke: STROKES-Schlüssel (Vorhand/Rückhand/…), shot }.
+   * Die Figur dreht ab dem Tastendruck auf und hält die Pose zwischen Bereitschaft und größter Ausholbewegung (A.cock),
+   * je voller der Balken, desto weiter (bei vollem Balken mit Cartoon-Übertreibung A.wind). Beine laufen weiter.
+   * Ein folgendes playStroke() schwingt aus dieser Pose kurz und schnell zum Treffer.
+   */
+  setCharge(v, o = null) {
+    if (v == null || v < 0) { this.chargeIn = null; return; }
+    const ci = this.chargeIn || (this.chargeIn = { v: 0, type: 'forehand', shot: 'topspin' });
+    ci.v = clamp(v, 0, 1);
+    if (o && o.stroke && this.anim.strokes[o.stroke]) ci.type = o.stroke;
+    if (o && o.shot) ci.shot = o.shot;
+  }
+
+  /**
    * Schlag starten: Kontakt exakt nach timeToContact Sekunden bei contactWorld.
-   * type: STROKES-Schlüssel; shot: 'topspin'|'slice'|'lob'|'drop'|'flat'; power 0..1.
+   * type: STROKES-Schlüssel; shot: 'topspin'|'slice'|'lob'|'drop'|'flat'; power 0..1;
+   * lunge 0..1: langer Ausfallschritt/Hechtsprung (Rettungsschlag). Läuft gerade das Ausholen (setCharge), beginnt der
+   * Clip an der gehaltenen Ausholpose (A.cock) – der Vorschwung dauert dann genau timeToContact.
    */
   playStroke(type, o = {}) {
     if (type === 'serve') return this.playServe('swing', o);
     const A = this.anim.strokes[type] || this.anim.strokes.forehand;
     const T = Math.max(0.05, o.timeToContact !== undefined ? o.timeToContact : A.W);
+    const ch = this.action && this.action.kind === 'charge' && this.action.w > 0.05 && A.cock !== undefined ? this.action : null;
     const act = this._newAction('stroke', A.clip);
     act.type = type; act.A = A; act.shot = o.shot || 'topspin'; act.power = o.power !== undefined ? o.power : 0.6;
     act.T = T; act.W = A.W;
-    act.speed = clamp(A.W / T, 0.7, 1.6);
+    act.lunge = clamp(o.lunge || 0, 0, 1);
+    act.wind = ch ? ch.wv * ch.w : 0;
+    act.speed = ch ? clamp(-A.cock / T, 0.5, 2.2) : clamp(A.W / T, 0.7, 1.6);
     act.contact = new Float32Array(o.contactWorld || this._defaultContact(type, _v0));
     act.contacted = false;
     // Schlagrahmen: vorhergesagte Körperposition beim Treffer
@@ -347,8 +369,19 @@ export class Character {
     act.feetMode = act.run > 0.5 ? 'gait' : 'plan';
     act.stepsDone = 0;
     act.hop = this._autoHop(type, act, A);
-    this._startAction(act, 0.1);
-    this.exertion = Math.min(1, this.exertion + 0.08);
+    this._startAction(act, ch ? 0.05 : 0.1);
+    this.exertion = Math.min(1, this.exertion + 0.08 + 0.1 * act.lunge);
+  }
+
+  /**
+   * Kontakt exakt auf das Ende des nächsten update(dtNext) legen und den Treffpunkt setzen (Spiellogik meldet den
+   * Treffer). Danach liegt der Sweet-Spot – soweit Arm und Körper reichen – genau auf pos.
+   */
+  alignContact(pos, dtNext) {
+    const a = this.action;
+    if (!a || a.contacted || !(a.kind === 'stroke' || (a.kind === 'serve' && a.sub === 'swing'))) return;
+    a.contact[0] = pos[0]; a.contact[1] = pos[1]; a.contact[2] = pos[2];
+    a.T = a.tau + Math.max(0, dtNext);
   }
 
   /** Aufschlag-Phasen: 'idle' | 'bounce' | 'toss' | 'swing' (timeToContact, contactWorld) | 'follow'. */
@@ -429,6 +462,22 @@ export class Character {
     this.action = null;
   }
 
+  /** Ausholen starten/wechseln/beenden (Schlag und Aufschlag haben Vorrang). */
+  _updateCharge() {
+    const ci = this.chargeIn, a = this.action;
+    if (a && !a.done && (a.kind === 'stroke' || a.kind === 'serve')) return;
+    if (!ci) { if (a && a.kind === 'charge') this.stopAction(); return; }
+    if (a && a.kind === 'emote' && !a.done && a.tau < 0.3) return;
+    if (!a || a.kind !== 'charge' || a.type !== ci.type) {
+      const A = this.anim.strokes[ci.type];
+      const act = this._newAction('charge', A.clip);
+      act.type = ci.type; act.A = A; act.W = A.W; act.v = ci.v; act.wv = 0; act.feetMode = 'gait';
+      // Wechsel Vorhand <-> Rückhand: von der Bereitschaft aus neu aufdrehen
+      this._startAction(act, a && a.kind === 'charge' ? 0.16 : 0.12);
+    }
+    this.action.v = ci.v; this.action.shot = ci.shot;
+  }
+
   _newAction(kind, clip) {
     return { kind, clip, t: 0, tau: 0, w: 0, fade: 0.1, speed: 1, done: false, sub: null, loop: false, feetMode: 'plan', hop: null, stepsDone: 0, lowerW: 1 };
   }
@@ -497,7 +546,8 @@ export class Character {
     const speed = Math.hypot(this.vel[0], this.vel[2]);
     this.exertion = Math.max(0, Math.min(1, this.exertion + dt * (speed > 3 ? 0.06 : -0.035)));
 
-    // 1) Aktion fortschreiben (Zeit, Gewichte, Fußarbeit-Befehle)
+    // 1) Aktion fortschreiben (Zeit, Gewichte, Fußarbeit-Befehle); Ausholen (setCharge) als eigene Aktion
+    this._updateCharge();
     this._updateAction(dt);
     const act = this.action;
     const actW = act ? act.w : 0;
@@ -579,6 +629,17 @@ export class Character {
     if (!a) return;
     a.tau += dt;
     const sv = this.serve;
+    if (a.kind === 'charge') {
+      // Ausholpose: Clip-Zeit zwischen Bereitschaft und größter Ausholbewegung, je nach Balken; weich nachgeführt
+      const A = a.A, cock = A.cock !== undefined ? A.cock : -0.18;
+      const target = (A.W + cock) * (0.3 + 0.7 * smoothstep(0, 1, a.v));
+      const k = 1 - Math.exp(-dt * 14);
+      a.t += (target - a.t) * k;
+      a.wv += (smoothstep(0.35, 1, a.v) - a.wv) * k;
+      a.w = smoothstep(0, 1, Math.min(1, a.tau / a.fade));
+      a.lowerW = 0.4 * (1 - smoothstep(0.2, 0.9, Math.hypot(this.vel[0], this.vel[2]) / this.bodyScale));
+      return;
+    }
     if (a.kind === 'stroke' || (a.kind === 'serve' && a.sub === 'swing')) {
       const tc = a.W - a.speed * (a.T - a.tau);
       if (a.tau <= a.T) a.t = Math.max(0, tc);
@@ -646,11 +707,12 @@ export class Character {
 
   /** Fußarbeit-Befehle einer Aktion (Zeit tr relativ zum Treffer bzw. Emote-Zeit). */
   _actionSteps(a, tr) {
+    if (a.kind === 'charge') return;
     const steps = a.kind === 'emote' ? a.E.steps : a.A && a.A.steps;
-    if (a.feetMode === 'gait') return;
     const S = this.bodyScale;
     const c = Math.cos(a.oyaw), s = Math.sin(a.oyaw);
-    if (steps) {
+    // Laufschlag: Schritte übernimmt der Gang, ein Sprung (Schmetterball) findet trotzdem statt
+    if (steps && a.feetMode !== 'gait') {
       while (a.stepsDone < steps.length && tr >= steps[a.stepsDone].t) {
         const st = steps[a.stepsDone++];
         const i = st.foot === 'l' ? 0 : 1;
@@ -667,6 +729,8 @@ export class Character {
     const h = a.hop;
     if (h && !h.started && tr >= h.t0) {
       h.started = true;
+      // Schwung startet erst nach dem geplanten Absprung (Ausholpose gehalten): Sprung ab jetzt, Scheitel am Treffer
+      if (a.kind !== 'emote' && tr > h.t0 + 0.02) { h.t0 = tr; h.t1 = Math.max(0.12, -tr); }
       // Echtzeit-Dauer (vor dem Treffer läuft der Clip mit a.speed)
       const dur = a.kind === 'emote' ? h.t1 - h.t0 : Math.max(0, -h.t0) / (a.speed || 1) + Math.max(0, h.t1);
       for (let i = 0; i < 2; i++) {
@@ -815,10 +879,13 @@ export class Character {
 
   _sampleAction(a, t, out) {
     sampleClip(this.def, a.clip, t, out);
+    if (a.kind === 'charge') { if (a.A.wind && a.wv > 0) addPose(out, out, a.A.wind, a.wv); return; }
     if (a.kind !== 'stroke' && !(a.kind === 'serve' && a.sub === 'swing')) return;
     const A = a.A;
-    if (!A || !A.add) return;
     const tr = t - a.W;
+    // Ausholen aus der gehaltenen Pose: Zusatzdrehung läuft im Vorschwung bis kurz vor dem Treffer aus
+    if (a.wind > 0 && A && A.wind) addPose(out, out, A.wind, a.wind * (1 - smoothstep(A.cock, -0.02, tr)));
+    if (!A || !A.add) return;
     const e = env(tr, -a.W * 0.8, -0.05, A.envOut || 0.15, (A.envOut || 0.15) + 0.3);
     if (a.wLow > 0 && A.add.low) addPose(out, out, A.add.low, a.wLow * e);
     if (a.wHigh > 0 && A.add.high) addPose(out, out, A.add.high, a.wHigh * e);
@@ -896,11 +963,12 @@ export class Character {
       if (u > 0 && u < 1) out.t[1] += h.h * Math.sin(Math.PI * u);
       else if (u >= 1 && u < 1.8) out.t[4] -= 0.06 * S * Math.sin(Math.PI * (u - 1) / 0.8) * Math.min(1, h.h * 6);
     }
-    // Varianten: Ballhöhe -> Hocke/Streckung
+    // Varianten: Ballhöhe -> Hocke/Streckung; Rettung (lunge): tiefer Ausfallschritt mit Vorlage
     if (act && (act.kind === 'stroke' || act.sub === 'swing')) {
       const tr = act.t - act.W;
       const e = env(tr, -act.W * 0.85, -0.06, 0.12, 0.45) * act.w;
-      out.t[4] += (-act.wLow * 0.17 + act.wHigh * 0.03) * S * e;
+      out.t[4] += (-act.wLow * 0.17 + act.wHigh * 0.03 - (act.lunge || 0) * 0.14) * S * e;
+      if (act.lunge) { qAxis(_q0, 1, 0, 0, act.lunge * 22 * DEG * e); postRot(out, this.bi.spine, _q0); }
     }
     void hipW;
   }
@@ -1037,7 +1105,8 @@ export class Character {
     const maxL = g.armLen * 0.975;
     const a = this.action;
     const pre = a && a.type && STROKES[a.type] ? STROKES[a.type].preBounce : false;
-    let budH = (pre ? 0.9 : 0.75) * K, budDown = 0.36 * S, budUp = 0.12 * K, bend = 1.3, twist = 0.6;
+    const lg = a && a.lunge ? a.lunge : 0;            // Rettung: längerer Ausfallschritt
+    let budH = (pre ? 0.9 : 0.75) * K * (1 + 0.7 * lg), budDown = 0.36 * S * (1 + 0.4 * lg), budUp = 0.12 * K, bend = 1.3, twist = 0.6;
     for (let it = 0; it < 12; it++) {
       getBoneModel(def, P, 'arm_r', _q0, _v2);
       const dx = H[0] - _v2[0], dy = H[1] - _v2[1], dz = H[2] - _v2[2];
