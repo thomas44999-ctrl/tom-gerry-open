@@ -1,6 +1,7 @@
 // Figuren-Probe: direkter Vergleich möglicher Figurenstile im Open-Stadion (keine Integration ins Spiel).
 //   dev.html?scene=figuren-probe&v=a|b|c&pose=bereit|laufen|aus|treffer|jubel|enttaeuscht&cam=spiel|nah&licht=stadion|weich
-//   &anim=1 (Animation läuft statt gehaltener Pose)  &t=<s> (Zeit einfrieren)
+//   &anim=1 (Animation läuft statt gehaltener Pose)  &t=<s> (Zeit einfrieren)  &label=0 (ohne Beschriftung)
+//   Im Animationsmodus treffen alle drei Varianten den Ball zur selben Zeit (T_HIT); laufen = quer über den Platz.
 //   A = Pixelfiguren aus Tom & Gerry Flutlicht als Billboards (src/chars/probe-pixel.js)
 //   B = einfache 3D-Spielzeugfiguren aus Code (src/chars/probe-toy.js)
 //   C = Referenz: heutige Chibi-Figuren (src/chars/tom.js, gerry.js, character.js)
@@ -22,6 +23,8 @@ const SPOTS = {
   nah: { tom: { pos: [-0.72, 0, 7.4], yaw: 0.32 }, gerry: { pos: [0.72, 0, 7.4], yaw: -0.32 } },
 };
 const RUN_SPEED = 4.2;
+const T_HIT = 0.82;          // Treffzeitpunkt im Animationsmodus (B: 0,5 s bereit + 0,32 s Ausholen)
+const STROKE = (p) => p === 'aus' || p === 'treffer';
 
 // ---------------------------------------------------------------- Licht
 function softLight(base) {
@@ -66,7 +69,7 @@ function driveC(c, spot, pose) {
     return;
   }
   if (pose === 'jubel') { c.playEmote('celebrate'); step(36); return; }
-  if (pose === 'enttaeuscht') { c.playEmote('dejected'); step(66); return; }
+  if (pose === 'enttaeuscht') { c.playEmote('dejected'); step(36); return; }
   step(30);
 }
 
@@ -85,7 +88,9 @@ export async function run({ renderer: r, devkit, params }) {
   const baseLight = { sun: { ...scene.sun }, hemi: { ...scene.hemi }, exposure: scene.exposure, post: { ...scene.post } };
   const soft = softLight(baseLight);
 
-  const figs = {};       // v -> { tom, gerry, drawables(), pose(p, cam), update(dt, cam) }
+  const figs = {};       // v -> { list, drawables(), pose(p, cam, anim), update(dt, cam), moves }
+  const tl = { t: 0, events: [] };
+  const at = (t, fn) => tl.events.push({ t, fn });
   async function ensure(v) {
     if (figs[v]) return figs[v];
     t0 = performance.now();
@@ -101,10 +106,13 @@ export async function run({ renderer: r, devkit, params }) {
         pose(p, cam, anim) {
           for (const f of [tom, gerry]) {
             f.position.set(SPOTS[cam][f.id].pos);
-            if (anim) f.play(ANIM[p]); else f.setPose(...FRAME[p]);
+            if (!anim) f.setPose(...FRAME[p]);
+            else if (STROKE(p)) { f.play('bereit'); at(T_HIT - 2 / 14, () => f.play('vorhand')); }
+            else f.play(ANIM[p]);
           }
         },
         update(dt, camera) { tom.update(dt, camera); gerry.update(dt, camera); },
+        moves: true,
       };
     } else if (v === 'b') {
       const { buildToyFigure } = await import('../../src/chars/probe-toy.js');
@@ -120,6 +128,7 @@ export async function run({ renderer: r, devkit, params }) {
           }
         },
         update(dt) { tom.update(dt); gerry.update(dt); },
+        moves: true,
       };
     } else {
       const [{ buildTom }, { buildGerry }, { buildRacket }, { Character }] = await Promise.all([
@@ -133,10 +142,27 @@ export async function run({ renderer: r, devkit, params }) {
       figs.c = {
         list: [tom, gerry],
         drawables: () => [...tom.drawables, ...gerry.drawables],
-        pose(p, cam) {
-          for (const f of [tom, gerry]) driveC(f, { ...SPOTS[cam][f.id], runYaw: runYaw(cam, f.id) }, p);
+        pose(p, cam, anim) {
+          for (const f of [tom, gerry]) {
+            const spot = { ...SPOTS[cam][f.id], runYaw: runYaw(cam, f.id) };
+            f._run = null;
+            if (!anim) { driveC(f, spot, p); continue; }
+            if (p === 'laufen') { driveC(f, spot, p); f._run = [RUN_SPEED, 0, 0]; continue; }
+            driveC(f, spot, 'bereit');
+            if (STROKE(p)) at(T_HIT - 0.5, () => f.playStroke('forehand', { timeToContact: 0.5, shot: 'topspin', power: 0.8 }));
+            else if (p === 'jubel') at(0.1, () => f.playEmote('celebrate'));
+            else if (p === 'enttaeuscht') at(0.1, () => f.playEmote('dejected'));
+          }
         },
-        update(dt) { if (dt > 0) { tom.update(dt); gerry.update(dt); } },
+        update(dt) {
+          if (dt <= 0) return;
+          for (const f of [tom, gerry]) {
+            if (f._run) { f.position[0] += f._run[0] * dt; f.position[2] += f._run[2] * dt; }
+            f.setLocomotion(f._run || [0, 0, 0], 1);
+            f.update(dt);
+          }
+        },
+        moves: false,
       };
     }
     buildMs[v] = performance.now() - t0;
@@ -179,13 +205,32 @@ export async function run({ renderer: r, devkit, params }) {
     scene.exposure = L.exposure; scene.post = L.post;
     scene.shadow = { ...scene.shadow, strength: L.shadow ? L.shadow.strength : 1 };
     cameraFor(state.cam);
+    tl.t = 0; tl.events.length = 0;
     F.pose(state.pose, state.cam, state.anim);
     F.update(0, devkit.camera);
     label.textContent = `${VARIANT_LABEL[state.v]}\n${POSE_LABEL[state.pose]} · ${state.cam === 'spiel' ? 'Spielkamera' : 'Nahaufnahme'}${state.licht === 'weich' ? ' · weiches Licht' : ''}`;
     probe.frame = devkit.frame;
     return true;
   }
-  const probe = window.__probe = { set, buildMs, state, frame: 0, ready: false };
+  /** Animationsschritt: Zeitplan, Figuren, Laufen quer über den Platz, Kamera fährt in der Nahaufnahme mit. */
+  function animStep(dt) {
+    tl.t += dt;
+    for (const e of tl.events) if (!e.done && tl.t >= e.t) { e.done = true; e.fn(); }
+    if (state.pose === 'laufen' && active.moves) for (const f of active.list) f.position[0] += RUN_SPEED * dt;
+    active.update(dt, devkit.camera);
+    if (state.pose === 'laufen' && state.cam === 'nah') {
+      const x = active.list.reduce((a, f) => a + f.position[0], 0) / active.list.length;
+      devkit.camera.position[0] = x; devkit.camera.target[0] = x;
+    }
+  }
+  /** Für Aufnahmen: Animation um sec Sekunden vorspulen (60-Hz-Schritte). */
+  function advance(sec) {
+    const n = Math.max(1, Math.round(sec * 60));
+    for (let i = 0; i < n; i++) animStep(sec / n);
+    return tl.t;
+  }
+  if (!params.bool('label', true)) label.style.display = 'none';
+  const probe = window.__probe = { set, advance, buildMs, state, frame: 0, ready: false };
   await set({});
 
   window.addEventListener('keydown', (e) => {
@@ -201,7 +246,7 @@ export async function run({ renderer: r, devkit, params }) {
     scene,
     update(dt, t) {
       world.update(dt, { time: t, ballPos: [0, -5, 0], events: [], excitement: 0.2, camera: devkit.camera });
-      if (active) active.update(state.anim ? dt : 0, devkit.camera);
+      if (active) { if (state.anim && dt > 0) animStep(dt); else active.update(0, devkit.camera); }
       probe.ready = true;
     },
   });

@@ -149,7 +149,7 @@ export const TOY_POSES = {
   slump: {
     hips: [0, -0.04, 0], sq: 0.93, mood: 'sad', tailBase: 25,
     rot: {
-      body: [26, 0, 0], head: [26, 0, 6],
+      body: [22, 0, 0], head: [12, 0, 8],
       armL: [6, 0, 4], foreL: [-4, 0, 0], armR: [6, 0, -4], foreR: [-4, 0, 0], racket: [118, 0, 0],
       legL: [0, 0, -3], legR: [0, 0, 3], footL: [0, -18, 0], footR: [0, 18, 0],
       tail: [6, 0, 0],
@@ -158,7 +158,7 @@ export const TOY_POSES = {
   slump2: {
     hips: [0, -0.06, 0], sq: 0.9, bob: 0.03, mood: 'sad', tailBase: 30,
     rot: {
-      body: [32, 0, 0], head: [30, 0, -8],
+      body: [27, 0, 0], head: [18, 0, -8],
       armL: [8, 0, 2], foreL: [-2, 0, 0], armR: [8, 0, -2], foreR: [-2, 0, 0], racket: [122, 0, 0],
       legL: [0, 0, -4], legR: [0, 0, 4], footL: [0, -20, 0], footR: [0, 20, 0],
       tail: [4, 0, 0],
