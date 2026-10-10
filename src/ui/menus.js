@@ -9,7 +9,7 @@ import { normSets } from './hud.js';
 // ------------------------------------------------------------------ Einstellungen
 
 export const DEFAULT_SETTINGS = Object.freeze({
-  player: 'tom', difficulty: 'normal', format: 'short', mode: 'single', pace: 'normal',
+  player: 'tom', difficulty: 'normal', format: 'short', mode: 'single', pace: 'normal', assist: 'light',
   quality: 'auto', sound: true, voice: true,
 });
 
@@ -20,6 +20,7 @@ export const OPTIONS = {
   format: [['tiebreak', 'Tiebreak (bis 7)'], ['short', 'Kurzer Satz (bis 4)'], ['set', 'Ein Satz (bis 6)'], ['bo3', 'Best of 3']],
   mode: [['single', 'Einzel gegen CPU'], ['watch', 'Zuschauen (CPU gegen CPU)']],
   pace: [['relaxed', 'Gemütlich'], ['normal', 'Normal'], ['brisk', 'Flott']],
+  assist: [['off', 'Aus'], ['light', 'Leicht'], ['strong', 'Stark']],
   quality: [['auto', 'Auto'], ['low', 'Niedrig'], ['medium', 'Mittel'], ['high', 'Hoch'], ['ultra', 'Ultra']],
   sound: [[true, 'An'], [false, 'Aus']],
   voice: [[true, 'An'], [false, 'Aus']],
@@ -279,7 +280,7 @@ export class TitleMenu {
     const sep = h('div', 'tg-menu-sep', '<span>Einstellungen</span>');
     const rows = [
       ['player', 'Spieler', 'user'], ['difficulty', 'Gegner', 'gauge'], ['format', 'Format', 'court'], ['pace', 'Spieltempo', 'bolt'],
-      ['mode', 'Modus', 'eye'], ['quality', 'Grafik', 'sparkle'], ['sound', 'Ton', 'sound'], ['voice', 'Schiedsrichter-Stimme', 'voice'],
+      ['assist', 'Laufhilfe', 'target'], ['mode', 'Modus', 'eye'], ['quality', 'Grafik', 'sparkle'], ['sound', 'Ton', 'sound'], ['voice', 'Schiedsrichter-Stimme', 'voice'],
     ];
     this.optEls = {};
     const items = [{ el: start, activate: () => this._start(), sound: 'start' }];
@@ -373,12 +374,13 @@ export class PauseMenu {
     const restart = buttonItem('Neustart', 'restart');
     const controls = buttonItem('Steuerung', 'gamepad');
     const pace = optionItem('Spieltempo', 'bolt'); pace.dataset.key = 'pace';
+    const assist = optionItem('Laufhilfe', 'target'); assist.dataset.key = 'assist';
     const quality = optionItem('Grafik', 'sparkle'); quality.dataset.key = 'quality';
     const sound = optionItem('Ton', 'sound'); sound.dataset.key = 'sound';
     const quit = buttonItem('Hauptmenü', 'home');
-    this.optEls = { pace, quality, sound };
+    this.optEls = { pace, assist, quality, sound };
     this.restartEl = restart; this.quitEl = quit;
-    this.menu.append(resume, restart, controls, pace, quality, sound, quit);
+    this.menu.append(resume, restart, controls, pace, assist, quality, sound, quit);
     this.screen = ui.nav.screen({
       el: this.el,
       items: [
@@ -386,6 +388,7 @@ export class PauseMenu {
         { el: restart, activate: () => this._confirm(restart, 'Neustart', () => this.h.onRestart?.()) },
         { el: controls, activate: () => this.ui.showControls() },
         { el: pace, adjust: (d) => this._cycle('pace', d) },
+        { el: assist, adjust: (d) => this._cycle('assist', d) },
         { el: quality, adjust: (d) => this._cycle('quality', d) },
         { el: sound, adjust: (d) => this._cycle('sound', d) },
         { el: quit, activate: () => this._confirm(quit, 'Hauptmenü', () => this.h.onQuit?.()) },
@@ -509,9 +512,9 @@ export class ControlsOverlay {
       </div>
       <div class="tg-tips">
         <div class="tg-tip">${icon('ball')}<div><b>Aufschlag</b><span>Taste drücken = Ballwurf, nochmal drücken = Schlag. Triff im goldenen Bereich des Timing-Balkens.</span></div></div>
-        <div class="tg-tip">${icon('target')}<div><b>Zielen</b><span>Richtung beim Schlag halten: links/rechts für die Ecken, vor/zurück für Länge.</span></div></div>
-        <div class="tg-tip">${icon('bolt')}<div><b>Kraft</b><span>Früh drücken = mehr Kraft. Der Ring am Spieler zeigt die Ladung.</span></div></div>
-        <div class="tg-tip">${icon('user')}<div><b>Laufen</b><span>Du läufst selbst – Vorhand, Rückhand, Volley und Schmetterball wählt das Spiel automatisch.</span></div></div>
+        <div class="tg-tip">${icon('bolt')}<div><b>Kraft</b><span>Schlagtaste drücken: Der Balken neben dir füllt sich, die Figur holt aus. Kraft beim Treffer = Balken. Laden bremst dich.</span></div></div>
+        <div class="tg-tip">${icon('target')}<div><b>Risiko</b><span>Der Kreis auf dem Platz zeigt, wo der Ball landet. Vor = hart und tief, zurück = sicher, seitlich = Winkel. Rot = über der Linie.</span></div></div>
+        <div class="tg-tip">${icon('user')}<div><b>Laufen</b><span>Stell dich selbst zum Ball – nur nahe Bälle erreicht der Ausfallschritt. Tiefe Bälle nicht voll durchziehen: Netz!</span></div></div>
       </div>
       <footer class="tg-controls-foot"><span><kbd>Esc</kbd> / ${icon('gamepad')} <b>B</b> Zurück</span></footer>
     </div>`;

@@ -5,7 +5,8 @@ import { Match, MATCH_DT, makeInput } from '../src/game/match.js';
 import { Ball, BALL, predict, Trajectory } from '../src/sim/ball.js';
 import { solveShot } from '../src/sim/shot.js';
 import { COURT, inServiceBox } from '../src/sim/court.js';
-import { STROKES } from '../src/sim/strokes.js';
+import { STROKES, CHARGE } from '../src/sim/strokes.js';
+import { strokeKey } from '../src/game/player.js';
 import { rotateVel } from '../src/game/player.js';
 
 const args = process.argv.slice(2);
@@ -152,7 +153,8 @@ function statsSection() {
     }
     if (diffs[0] === 'normal' && diffs[1] === 'normal') {
       const ar = avg(rally);
-      ok(ar >= 3.5 && ar <= 9, `normal: Ø Ballwechsel 3.5..9 (ist ${f2(ar)})`);
+      // Prototyp 3: ohne Zufalls-Netzfehler und Gauß-Streuung werden Ballwechsel länger; Feinabstimmung in Teil B
+      ok(ar >= 3.5 && ar <= 14, `normal: Ø Ballwechsel 3.5..14 (ist ${f2(ar)})`);
       ok(sum((s) => s.dfs) / P < 0.08, 'normal: Doppelfehler < 8 %');
       ok(sum((s) => s.aces) / P < 0.2, 'normal: Asse < 20 %');
     }
@@ -404,15 +406,19 @@ function scriptSection() {
   }
   // --- 10. Menschlicher Skript-Spieler gegen jede KI-Stufe (Balance)
   {
-    const res = {};
+    const res = {}, rally = {};
     for (const diff of ['easy', 'normal', 'hard']) {
       for (const style of ['lazy', 'good', 'robot']) {
         let won = 0, total = 0;
-        for (const seed of [21, 22]) { const r = humanBotMatch(diff, style, seed, 60); won += r.won; total += r.total; }
+        const rl = [];
+        const onEv = (e) => { if (e.type === 'point') rl.push(e.rally); };
+        for (const seed of [21, 22]) { const r = humanBotMatch(diff, style, seed, 60, onEv); won += r.won; total += r.total; }
         res[diff + '/' + style] = won / Math.max(1, total);
+        if (style === 'good') rally[diff] = avg(rl);
       }
     }
     console.log('  Mensch-Bot (Punktgewinn %): ' + Object.entries(res).map(([k, v]) => `${k} ${(100 * v).toFixed(0)}%`).join(', '));
+    console.log('  Mensch-Bot "good": Ø Ballwechsel ' + Object.entries(rally).map(([k, v]) => `${k} ${f1(v)}`).join(', '));
     ok(res['easy/good'] > res['normal/good'] && res['normal/good'] > res['hard/good'], 'Balance: easy > normal > hard');
     ok(res['easy/good'] > 0.6, 'Balance: easy klar schlagbar');
     ok(res['normal/good'] > 0.4 && res['normal/good'] < 0.7, 'Balance: normal ausgeglichen');
@@ -428,20 +434,23 @@ function mulberry(seed) {
 }
 
 /**
- * Skript-"Mensch" (Slot 0) gegen KI (Slot 1).
- *   'lazy'  : steht still, drückt nur (testet die Bewegungshilfe)
- *   'good'  : menschenähnlich – Reaktion 0.3 s, ungenauer Laufweg (σ 0.4 m), Druckzeitpunkt variiert (10 % zu spät),
- *             zielt oft mit voller Richtung (digitale Tastatur), Aufschlag-Timing σ 0.05 s
- *   'robot' : kennt den idealen Treffpunkt, läuft perfekt, lädt immer voll auf (Obergrenze)
+ * Skript-"Mensch" (Slot 0) gegen KI (Slot 1), Schlagkern Prototyp 3 (Balken lädt ab Druck, Laden bremst, Ausfallschritt,
+ * Zielkreis sichtbar).
+ *   'lazy'  : steht still, drückt nur (testet die Laufhilfe)
+ *   'good'  : menschenähnlich – Reaktion 0.25–0.4 s, ungenauer Laufweg (σ ~0.4 m, wird beim Annähern kleiner), will meist
+ *             viel Kraft, drückt, sobald der Platz auch gebremst erreichbar ist (10 % zu spät), zielt oft mit voller Richtung
+ *             (digitale Tastatur), nimmt bei rotem Kreis meist (60 %) Richtung und Länge zurück; Aufschlag-Timing σ 0.05 s
+ *   'robot' : kennt den idealen Treffpunkt, läuft perfekt, lädt voll, zielt nie über die Linie (Obergrenze)
+ * opts.assist: Laufhilfe ('off'|'light'|'strong', Standard 'light').
  */
-function humanBotMatch(diff, style, seed, nPoints, onEvent = null) {
-  const m = new Match({ humans: [0], difficulty: diff, seed, format: { sets: 3 } });
+function humanBotMatch(diff, style, seed, nPoints, onEvent = null, opts = {}) {
+  const m = new Match({ humans: [0], difficulty: diff, seed, format: { sets: 3 }, assist: opts.assist || 'light' });
   const rnd = mulberry(seed * 97 + 5);
   const g = () => rnd() + rnd() + rnd() - 1.5;   // ~N(0, 0.5)
   const inp = makeInput();
   const P0 = m.players[0];
   const robot = style === 'robot', moves = style !== 'lazy';
-  let won = 0, total = 0, pressAt = null, aimLr = 0, aimD = 0.3, shotId = -1, offX = 0, offZ = 0, lead = 0.6, react = 0.3;
+  let won = 0, total = 0, pressAt = null, aimLr = 0, aimD = 0.3, shotId = -1, offX = 0, offZ = 0, want = 0.8, late = false, react = 0.3, pulled = false;
   for (let i = 0; i < 120 * 60 * 40 && total < nPoints && !m.state.over; i++) {
     const S = m.state;
     inp.move[0] = inp.move[1] = 0;
@@ -459,26 +468,44 @@ function humanBotMatch(diff, style, seed, nPoints, onEvent = null) {
       const incoming = m.rally.lastHitter === 1 && !m.rally.decided;
       const plan = P0.plan;
       if (incoming && m.rally.shotId !== shotId) {
-        shotId = m.rally.shotId;
-        if (robot) { aimLr = [-0.85, -0.4, 0, 0.4, 0.85][Math.floor(rnd() * 5)]; aimD = 0.2 + 0.6 * rnd(); offX = offZ = 0; lead = 0.95; react = 0.25; }
+        shotId = m.rally.shotId; pulled = false;
+        if (robot) { aimLr = [-0.6, -0.3, 0, 0.3, 0.6][Math.floor(rnd() * 5)]; aimD = 0.2 * rnd(); offX = offZ = 0; want = 1; late = false; react = 0.2; }
         else {
           const r = rnd();
           aimLr = r < 0.45 ? 0 : r < 0.6 ? 0.7 * Math.sign(rnd() - 0.5) : Math.sign(rnd() - 0.5);
           aimD = rnd() < 0.5 ? 0 : 1;
           offX = g() * 0.8; offZ = g() * 0.8;
-          lead = rnd() < 0.1 ? 0.3 : 0.45 + 0.5 * rnd();
+          want = rnd() < 0.15 ? 0.4 : 0.65 + 0.35 * rnd();
+          late = rnd() < 0.1;
           react = 0.25 + 0.15 * rnd();
         }
       }
+      const swingT = plan && plan.valid ? STROKES[strokeKey(plan.family, plan.hand, 'topspin')].swing : 0.2;
+      const tl = plan && plan.valid ? plan.time - m.time : 9;
       if (moves && incoming && plan && plan.valid && !P0.stroke && m.time - S.lastHitTime > react) {
-        const k = Math.min(1, Math.max(0, (plan.time - m.time) / 0.8));   // Fehler schrumpft beim Annähern
+        const k = Math.min(1, Math.max(0, (tl - swingT) / 0.8));   // Fehler schrumpft beim Annähern
         const dx = plan.pos[0] + offX * k - P0.pos[0], dz = plan.pos[2] + offZ * k - P0.pos[2], d = Math.hypot(dx, dz);
-        if (d > 0.05) { const f = Math.min(1, d / 0.6); inp.move[0] = (dx / d) * f; inp.move[1] = (dz / d) * f; }
+        if (d > 0.04) { const f = Math.min(1, d / 0.5); inp.move[0] = (dx / d) * f; inp.move[1] = (dz / d) * f; }
       } else if (moves && !incoming && !P0.stroke) {
         const dx = -P0.pos[0] * 0.6, dz = P0.side * (COURT.halfLength + 0.8) - P0.pos[2], d = Math.hypot(dx, dz);
         if (d > 0.3) { inp.move[0] = (dx / d) * 0.7; inp.move[1] = (dz / d) * 0.7; }
       }
-      if (incoming && plan && plan.valid && !P0.pending && plan.time - m.time < lead) inp.buttons.topspin = true;
+      // Laden: früh genug für die gewünschte Kraft, aber erst, wenn der Platz auch gebremst noch erreichbar ist
+      if (incoming && plan && plan.valid && !P0.pending && m.time - S.lastHitTime > react) {
+        const left = tl - swingT;
+        const dist = moves ? Math.hypot(plan.pos[0] - P0.pos[0], plan.pos[2] - P0.pos[2]) : 0;
+        const slowT = dist / (P0.stats.maxSpeed * CHARGE.moveMul) + 0.05;
+        let press = left <= want * CHARGE.fill && slowT <= left;
+        if (!moves) press = left <= 0.6;
+        if (late) press = left <= swingT * 0.3;
+        if (left <= 0.05) press = true;
+        if (press) inp.buttons.topspin = true;
+      }
+      // Risiko sehen: roter Kreis -> meist zurücknehmen (Roboter zielt nie über die Linie)
+      if (P0.preview.on && P0.preview.red && !pulled && !robot && style === 'good') {
+        pulled = true;
+        if (rnd() < 0.6) { aimLr *= 0.4; aimD = Math.min(aimD, 0); }
+      }
       // Zielrichtung: digitale Tastatur – Bewegungsrichtung und Ziel teilen sich die Tasten
       inp.aim[0] = aimLr; inp.aim[1] = aimD;
     }

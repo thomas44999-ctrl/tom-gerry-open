@@ -47,6 +47,7 @@ export class Sfx {
     let level = (0.3 + 0.7 * power) * TRIM.hit;
     if (serve) level *= 0.9; else if (smash) level *= 1.05; else if (volley) level *= 0.95;
     if (perfect) level *= 0.9; if (frame) level *= 0.62; if (off) level *= 0.92; if (slice) level *= 0.85;
+    if (p.strong) level *= 1.22;                     // starker Treffer (Treffer-Stopp): kräftiger
     level *= jit(1, 0.06);
     const out = this.G.strip('sfx', pos, level, serve || smash ? 0.32 : 0.26);
     // Härte des Kontakts: schneller Schlag → kürzerer Kontakt → hellerer Klick
@@ -90,6 +91,8 @@ export class Sfx {
     let ta = (0.08 + 0.16 * power) * (off ? 1.7 : 1) * (frame ? 1.6 : 1);
     if (smash) ta *= 2.0; else if (serve) ta *= 1.5; else if (volley) ta *= 0.8;
     mode(ac, out, t, fth, ta, (smash ? 0.022 : 0.014) * jit(1, 0.12), fth * 1.6, 0.007);
+    // 4b) starker Treffer: tiefer Körper-Wumms (fällt von ~140 auf ~70 Hz)
+    if (p.strong) mode(ac, out, t, jit(72, 0.05), 0.55, 0.05, 140, 0.03);
 
     // 5) Spin: Bürsten der Saiten über den Filz
     if (slice) this._noise(out, t, { amp: 0.16, attack: 0.003, hold: 0.006, tau: jit(0.016, 0.2), filters: [['bandpass', jit(3600, 0.12), 0.8]] });

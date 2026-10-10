@@ -30,8 +30,9 @@ UI language: **German**. Umpire calls: English (authentic tennis).
 
 1. **No dependencies, no network.** No npm install, no CDN, no fetch of external resources. Plain
    JavaScript ES modules + WebGL2 + WebAudio + DOM. Node ≥ 26 is available for tools/tests.
-2. **Work only inside the dev root** `$ROOT` (given in your task). Never write anywhere else except
-   temporary files under `/tmp/tg-*`. Do not touch the Google Drive.
+2. **Work only inside the project folder** (`Meine Ablage/10_code/games/tom-gerry-open`, or its git checkout).
+   Temporary files (screenshots, intermediate results, caches) go to `/tmp/tg-*`, never into the project folder
+   (Drive sync). No dependencies or build caches in the folder, no copies or "v2" files – versions live in git.
 3. **Own your files.** Only create/edit files assigned to you. If you need a change in someone else's
    file, describe it in your report (or write an adapter in your own file).
 4. **Module syntax restrictions** (a tiny custom bundler will inline everything into one HTML file):
@@ -65,6 +66,7 @@ src/chars/animlib.js       ANIM: all clips (locomotion, strokes, serve, emotes)
 src/sim/court.js ball.js shot.js rules.js   SIM: dimensions, ball physics, shot solver, scoring
 src/sim/strokes.js         CONTRACT gameplay⇄animation (exists; values tunable)
 src/game/player.js ai.js match.js input.js  GAMEPLAY
+src/game/charsync.js       GAMEPLAY⇄ANIM coupling (match time -> characters, drawn ball, contact frame), DOM-free
 src/game/camera.js director.js replay.js    CAMERA/DIRECTOR
 src/game/game.js, src/main.js               INTEGRATION
 src/world/*                ENV: court surface, net, stadium, crowd, props, scoreboard, ballfx, particles, world.js
@@ -269,7 +271,10 @@ head**, string plane = local XY plane (face normal ±Z). Length ≈ 0.685 m, hea
 const c = new Character(renderer, asset, racket);
 c.position (vec3, feet/root on ground), c.yaw
 c.setLocomotion(velWorld /*vec3*/, ready /*0..1 crouch/alertness*/)
-c.playStroke(type /*STROKES key*/, { timeToContact, contactWorld /*vec3*/, shot, power })  // contact exactly then
+c.setCharge(v /*0..1 | null*/, { stroke /*STROKES key*/, shot })   // backswing hold while the power bar fills (since P3)
+c.playStroke(type /*STROKES key*/, { timeToContact, contactWorld /*vec3*/, shot, power, lunge /*0..1 rescue*/ })  // contact exactly then;
+                           // after setCharge the clip starts at the held backswing (anim cock) -> short, fast forward swing
+c.alignContact(worldPos, dtNext)        // the next update(dtNext) ends exactly on contact, sweet spot on worldPos
 c.playServe(phase, opts)   // 'idle' | 'bounce' | 'toss' | 'swing' (swing has timeToContact) | 'follow'
 c.playEmote(name)          // 'fistpump' 'celebrate' 'jump' 'dejected' 'shrug' 'wave' 'clap' 'bow' 'catch_ball'
 c.lookAt(worldPos | null)
@@ -299,34 +304,69 @@ c.events                   // array of { type: 'footstep', foot, pos } since las
 Physics constants: g = 9.81; ball m = 0.057 kg, r = 0.0335 m; ρ = 1.21; Cd ≈ 0.55;
 C_L ≈ 1/(2 + v/(r|ω|)); sim at **fixed 120 Hz**.
 
-## 7. Gameplay (src/game: player.js, ai.js, match.js, input.js)
+## 7. Gameplay (src/game: player.js, ai.js, match.js, input.js, charsync.js)
 
 `Match` is pure logic (no DOM/WebGL), steppable in node:
 ```js
-const m = new Match({ players: ['tom','gerry'], humans: [0] /*indices driven by input*/, format, difficulty, seed });
+const m = new Match({ players: ['tom','gerry'], humans: [0] /*indices driven by input*/, format, difficulty, seed,
+                      assist: 'off'|'light'|'strong' /*movement assist for humans, default 'light'*/,
+                      breakOnHit: false /*true: step() returns right after the tick of a hit (contact frame)*/ });
 m.step(dt, inputs /* [PlayerInput, PlayerInput] — AI-controlled slots ignore theirs */);
+m.setAssist('light');
 m.state    // { phase, ball:{pos,vel,spin,visible,held}, players:[PlayerState], score:Score, server, ... }
 m.drainEvents() -> [GameEvent]
 PlayerInput = { move: [x, z] /*world-space desired dir, |v|<=1*/, aim: [lr, depth] /*-1..1 from hitter's view*/,
                 buttons: { topspin, slice, lob, drop } /*held booleans*/, skip: bool }
-PlayerState = { id, pos, vel, yaw, side, mode, stroke /*null|{type, shot, start, windup, contact:vec3}*/,
-                emote, charge, serveMeter, ... }
+PlayerState = { id, pos, vel, yaw, side, mode, stroke /*null|{type, shot, start, windup, contactTime, contact, from, to,
+                gap, rescue, miss, ...}*/, emote, charge /*power bar 0..1*/, pending /*{shot, pressTime}*/,
+                preview /*{on, x, z, r, red, net, quality, power} target circle while charging*/, serveMeter, ... }
 ```
 Phases: `pre_serve` (walk to position, ball bounces) → `serve` (toss/meter) → `rally` → `point_over`
 (≈2 s, emotes) → `between_points` (walk back; replays may run here) → … `change_ends` → `match_over`.
 Game events (drained by game.js and routed to audio/ui/world/director):
-`stroke_start {player, type, shot, windup, contact, power}`, `hit {player, type, shot, quality:
-'perfect'|'good'|'early'|'late'|'stretch'|'frame', speed, spin, pos}`, `serve_toss`, `bounce {pos, in,
-speed}`, `net {pos, cord}`, `let`, `fault {n}`, `double_fault`, `line_call {call:'out'|'fault', pos}`,
+`stroke_start {player, stroke, shot, windup, contact, contactTime, power, charge, rescue, miss}`,
+`hit {player, stroke, shot, quality: 'perfect'|'good'|'early'|'late'|'stretch'|'frame', speed, kmh, spin, pos,
+power /*= bar at contact*/, bar, pressTime, target /*circle centre*/, landing, radius, red, netDump, rescue, strong}`,
+`miss {player, pos, err, rescue}`, `serve_toss`, `bounce {pos, in, speed}`, `net {pos, cord}`, `let`, `fault {n}`, `double_fault`,
+`line_call {call:'out'|'fault', pos}`,
 `point {winner, reason: 'ace'|'service_winner'|'winner'|'forced_error'|'unforced_error'|'double_fault'|'net'|'out'|'double_bounce', rally, closeCall}`,
 `game`, `set`, `match`, `change_ends`, `serve_speed {kmh}`, `pressure {kind:'break_point'|'set_point'|'match_point'}`.
 
-Feel: Virtua-Tennis-style — press shot button early to charge (more power/precision), the swing
-fires automatically when the ball arrives; direction held at contact aims (left/right, deep/short);
-gentle movement assist toward the ideal contact position; forehand/backhand/volley/smash chosen
-automatically. Serve: press = toss, press again = hit (timing meter), direction aims.
+### 7.1 Stroke core (prototype 3, values in `src/sim/strokes.js`: CHARGE, HIT, RISK, STROKES[x].swing)
+
+* **Charge:** a shot button press starts the power bar (`CHARGE.fill` ≈ 0.9 s to full). It keeps filling until
+  contact and freezes there; the executed power is exactly that value (rescue shots: `HIT.rescuePower`). While
+  charging the player moves at `CHARGE.moveMul` (≈ 45 %). Empty = slow, safe, high ball; full = hard, flat ball.
+* **Swing:** the character winds up from the press on (`setCharge`, wider with more charge) and holds the pose. The
+  forward swing starts only `STROKES[x].swing` (≈ 0.2 s) before contact. The contact time is snapped to the 120 Hz grid,
+  so the ball at contact is exactly the predicted point.
+* **Hit or miss:** during the swing the player lunges at most `HIT.lunge` (scaled with reachScale) towards the ideal
+  stand position. A hit needs the ball within `HIT.radius` (≤ 0.35 m, scaled with reachScale) of the racket point after
+  the lunge, otherwise it is a visible miss (the racket swings past). Slightly out of reach: rescue with
+  `HIT.rescueLunge` (long lunge/dive, weak shot, big circle); far out of reach: no swing. Quality comes from the stand
+  position at swing start (`gap`: perfect ≤ 0.18 m, good ≤ 0.42 m, else stretch; pressed too late = late).
+* **Risk:** no hidden dice. The ball lands uniformly inside the target circle: centre from aim (forward = deeper,
+  harder, flatter; back = shorter, higher, safer; sideways = angle), radius from power, aim, quality, running speed,
+  incoming pace and player stats (`spreadRadius`). Circle over a line = red. Net errors only when visibly justified:
+  very low ball (< `RISK.lowBall` × reachScale) hit with ≥ `RISK.netPower` (bar shows "Netz!").
+* **Assist:** human movement assist is a setting (`ASSIST` off/light/strong), independent of the opponent level.
+* **AI** uses the same system (press timing = desired power, slowed while charging, `_fit` chooses target/power from
+  its own circle with `aiKeep` risk tolerance). Its strength comes from reaction, positioning and risk decisions.
+* **Serve** is unchanged (toss + timing meter).
+
+### 7.2 Gameplay ⇄ character coupling (`src/game/charsync.js`)
+
+`CharSync` drives the characters on the match clock (`sync.advance()` = match time since last call) and draws the
+ball: charge → `setCharge`, `stroke_start` → `playStroke` (time to contact on the shared clock), `hit` →
+`alignContact` (the frame ends exactly on contact; with `breakOnHit` the match stops on that tick). The IK target is
+the real ball position at contact (prediction and simulation use the same integrator), blended in over the last
+~0.14 s of the swing. The drawn ball is
+held at the contact point for that frame (and during the hit-stop) and pulled ≤ `HIT.magnet` towards the sweet spot
+just before contact. `test/stroke.test.mjs` checks ≤ 5 cm sweet spot ↔ drawn ball in AI-vs-AI contact frames.
+Strong hits (`hit.strong`) get a 60–80 ms hit-stop, a flash and a heavier sound.
+
 Keyboard: move WASD/arrows; J/Space = topspin, K = slice, L = lob, I = drop; Esc/P = pause.
-Gamepad: stick + A/B/Y/X, Start. AI uses the same PlayerInput; difficulty easy/normal/hard.
+Gamepad: stick + A/B/Y/X, Start.
 
 ## 8. Camera, director, replay (src/game/camera.js, director.js, replay.js)
 
@@ -358,7 +398,9 @@ UI (DOM overlay over the canvas, German text): `const ui = new UI(rootEl)`;
 `ui.loader.set(p, label)`, `ui.loader.hide()`; `ui.showTitle(settings, { onStart, onChange })`;
 `ui.hideTitle()`; `ui.hud.show()/hide()`, `ui.hud.setPlayers([{name, color}, …])`,
 `ui.hud.update(scoreView)`, `ui.hud.serveSpeed(kmh)`, `ui.hud.serveMeter(v|null)`,
-`ui.hud.charge(playerIdx, v|null)`, `ui.banner(title, sub, kind)`, `ui.toast(text)`,
+`ui.hud.power(playerIdx, v|null, screenPos, { frozen, kmh, net })` (power bar; `charge()` = alias),
+`ui.hud.aimCircle(playerIdx, screenPts|null, { red, land, fade })`, `ui.hud.impact(screenPos, strength)`,
+`ui.banner(title, sub, kind)`, `ui.toast(text)`,
 `ui.showPause({ onResume, onRestart, onQuit, settings, onChange })`, `ui.hidePause()`,
 `ui.showMatchEnd(stats, { onRematch, onMenu })`, `ui.showControls()`, `ui.fade(toBlack, ms) -> Promise`.
 

@@ -192,7 +192,8 @@ export const CONTROLS_DE = {
   single: [
     ['Bewegen', 'WASD / Pfeiltasten', 'Linker Stick / Steuerkreuz'],
     ['Topspin', 'J / Leertaste', 'A'], ['Slice', 'K', 'B'], ['Lob', 'L', 'Y'], ['Stopp', 'I', 'X'],
-    ['Zielen', 'Richtung beim Treffer halten', 'Stick beim Treffer'],
+    ['Laden', 'Schlagtaste früh drücken: Balken füllt sich (Kraft), Laufen langsamer', 'A/B/X/Y früh drücken'],
+    ['Zielen', 'Richtung halten: vor = hart/tief, zurück = sicher, seitlich = Winkel', 'Stick'],
     ['Aufschlag', 'Taste = Ballwurf, nochmal = Schlag (Anzeige voll)', 'A, nochmal A'],
     ['Pause', 'Esc / P', 'Start'], ['Weiter', 'Enter / Schlagtaste', 'A'],
   ],

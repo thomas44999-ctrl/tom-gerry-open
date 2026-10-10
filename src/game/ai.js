@@ -1,10 +1,12 @@
 // KI-Gegner: erzeugt PlayerInput wie ein Mensch (Bewegungsrichtung, Zielrichtung, Tastendrücke).
 // Reaktionszeit, Vorhersage (Abfangplan aus match/player), Positionsspiel (Abfangpunkt + Erholung zur
 // taktischen Grundposition), Schlagwahl nach Situation, Aufschlagvariation. Schwierigkeit easy/normal/hard.
+// Seit Prototyp 3 nutzt die KI denselben Schlagkern wie der Mensch: Powerbalken (Druckzeitpunkt = gewünschte Kraft,
+// Laden bremst), Zielkreis (Ziel so wählen, dass der eigene Kreis passt; Risiko nach Aggressivität).
 
 import { COURT } from '../sim/court.js';
-import { STROKES } from '../sim/strokes.js';
-import { Rng, difficultyOf, targetToAim, strokeKey } from './player.js';
+import { STROKES, CHARGE, RISK } from '../sim/strokes.js';
+import { Rng, difficultyOf, targetToAim, strokeKey, spreadRadius, shotPreset } from './player.js';
 
 const HL = COURT.halfLength;
 const SW = COURT.singlesHalfWidth;
@@ -160,21 +162,26 @@ export class AIController {
         this._recover(h, 0.5);
         return;
       }
-      // Lauf zum (leicht ungenauen) Standort
+      // Lauf zum (leicht ungenauen) Standort – Ankunft vor dem Schwungstart (danach nur noch Ausfallschritt)
       const tl = plan.time - m.time;
       const sp = this._stand, s = me.side;
-      const kOff = clamp(tl / 0.7, 0.3, 1);          // späte Feinkorrektur
+      const swingT = STROKES[strokeKey(plan.family, plan.hand, dec.shot)].swing;
+      const kOff = clamp((tl - swingT) / 0.7, 0.3, 1);          // späte Feinkorrektur
       sp[0] = plan.pos[0] + s * dec.offLat * kOff; sp[2] = plan.pos[2] - s * dec.offFwd * kOff;
       if (sp[2] * s < 0.5) sp[2] = 0.5 * s;
       this.standPos = sp;
-      this._steer(sp[0], sp[2], tl, 1);
-      // Taste drücken (Aufladen) – hoffnungslose Bälle nicht anschwingen
+      this._steer(sp[0], sp[2], tl - swingT - 0.04, 1);
+      // Taste drücken (Laden): Druckzeitpunkt = gewünschte Kraft; Laden bremst auf CHARGE.moveMul -> erst drücken,
+      // wenn der Standort auch mit gebremstem Lauf noch erreichbar ist. Hoffnungslose Bälle nicht anschwingen.
       if (!me.pending && plan.slack > -0.06 - 0.12 * (1 - d.aiSmart)) {
-        const key = strokeKey(plan.family, plan.hand, dec.shot);
-        const W = STROKES[key].windup;
-        let pressAt = plan.time - W - dec.charge;
-        if (dec.late) pressAt = plan.time - W * 0.55;
-        if (m.time >= pressAt) { inp.buttons[dec.shot] = true; this._countShot(dec); }
+        const SW = swingT;
+        const left = tl - SW;
+        const dist = Math.hypot(sp[0] - me.pos[0], sp[2] - me.pos[2]);
+        const slowT = dist / (me.stats.maxSpeed * CHARGE.moveMul * d.aiSpeed) + 0.05;
+        let press = left <= dec.charge * CHARGE.fill && slowT <= left;
+        if (dec.late) press = left <= SW * 0.4;
+        if (left <= 0.06) press = true;
+        if (press) { inp.buttons[dec.shot] = true; this._countShot(dec); }
       }
       this._applyAim(dec, plan.contact[0]);
     } else {
@@ -214,9 +221,22 @@ export class AIController {
     if (dec.pass) this.stats.passes++;
   }
 
+  /**
+   * Zielrichtung setzen. Beim Laden sieht die KI wie der Mensch ihren tatsächlichen Zielkreis (me.preview: echte Kraft,
+   * Stellung, Anlauf) und zieht das Ziel bis zum Treffer so nach innen, dass die Kreismitte dec.keep Radien von den
+   * Linien bleibt.
+   */
   _applyAim(dec, hitX) {
-    const me = this.me;
-    const a = targetToAim(me.side, hitX, dec.tx, dec.tz, aimShotFor(dec.family, dec.shot), this._aim || (this._aim = {}));
+    const me = this.me, pv = me.preview;
+    let tx = dec.tx, tz = dec.tz;
+    if (pv.on && dec.keep > 0) {
+      const m = pv.r * dec.keep, s = me.side;
+      const xMax = Math.max(0.3, SW - m);
+      tx = clamp(tx, -xMax, xMax);
+      const dz = Math.abs(tz), lo = pv.preset === 'drop' ? 1.2 : 0.9 + m * 0.5, hi = Math.max(lo + 0.2, HL - m);
+      tz = -s * clamp(dz, lo, hi);
+    }
+    const a = targetToAim(me.side, hitX, tx, tz, aimShotFor(dec.family, dec.shot), this._aim || (this._aim = {}));
     this.input.aim[0] = a.lr; this.input.aim[1] = a.depth;
   }
 
@@ -259,7 +279,8 @@ export class AIController {
     const oppDeep = oz > HL + 0.9;
     // Ungeduld in langen Ballwechseln: kleinere Sicherheitsabstände, mehr Angriffe
     const impatience = clamp((m.rally.hits - 6) / 10, 0, 0.6);
-    const margin = d.aiMargin * (1 - 0.65 * impatience);
+    // Linienabstand der Wunschziele klein halten: die Sicherheit regelt _fit über den eigenen Zielkreis (aiKeep)
+    const margin = d.aiMargin * 0.4 * (1 - 0.65 * impatience);
     const aggr = Math.min(1, d.aiAggression + impatience);
     const dec = { shot: 'topspin', family: plan.family, tx: 0, tz: 0, charge: 0.5, letGo: false, late: false, attack: false, pass: false, offLat: 0, offFwd: 0 };
     // Positionsfehler (Spieler steht nie perfekt): größer bei wenig Zeit
@@ -270,11 +291,11 @@ export class AIController {
       if (rng.chance(0.25 + 0.75 * d.aiSmart)) { dec.letGo = true; return dec; }
     }
     if (me.netMode && cz > 8.5 && plan.family === 'ground') me.netMode = false;   // überlobt
-    const lead = rng.range(d.aiChargeLead[0], d.aiChargeLead[1]);
+    // gewünschte Kraft (Powerbalken): Grundwert je Stufe, weiter Weg -> weniger (Laden bremst den Lauf)
+    const want = rng.range(d.aiPower[0], d.aiPower[1]);
     const tAvail = plan.time - Math.max(m.time, this.reactAt);
-    // weiter Weg: spät drücken (Aufladen bremst den Lauf)
     const runFactor = clamp((plan.slack - 0.05) / 0.45, 0.15, 1);
-    dec.charge = clamp(Math.min(lead * runFactor, tAvail - 0.45), 0, 1);
+    dec.charge = clamp(Math.min(want * runFactor, (tAvail - 0.35) / CHARGE.fill), 0, 1);
     dec.late = rng.chance(d.aiLatePress);
     const openSide = Math.abs(ox) > 0.6 ? -sgn(ox) : (rng.chance(0.5) ? 1 : -1);    // Weltseite (x-Vorzeichen) des offenen Platzes
     const zOpp = (dist) => -s * dist;
@@ -284,7 +305,7 @@ export class AIController {
     if (fam === 'smash') {
       dec.shot = 'topspin'; dec.tx = xIn(openSide, 0.7 * margin + 0.3); dec.tz = zOpp(rng.range(7.0, 9.0)); dec.charge = clamp(dec.charge + 0.3, 0, 1);
       dec.attack = true;
-      return dec;
+      return this._fit(dec, plan, aggr);
     }
     if (fam === 'volley') {
       dec.attack = true;
@@ -294,7 +315,7 @@ export class AIController {
       } else {
         dec.tx = xIn(openSide, 0.6 * margin + 0.4); dec.tz = zOpp(rng.range(6.5, 9.5));
       }
-      return dec;
+      return this._fit(dec, plan, aggr);
     }
     // ---- Grundschlag
     const hitX = plan.contact[0];
@@ -305,7 +326,7 @@ export class AIController {
       else if (rng.chance(0.5)) { dec.shot = 'slice'; dec.tx = xIn(-sgn(hitX || 1), 1.5 * margin + 0.3); dec.tz = zOpp(9.2); }
       else { dec.shot = 'topspin'; dec.tx = xIn(-sgn(hitX || 1), 1.4 * margin + 0.3); dec.tz = zOpp(8.8); }
       dec.charge = Math.min(dec.charge, 0.35);
-      return dec;
+      return this._fit(dec, plan, aggr);
     }
     if (oppNet) {
       dec.pass = true;
@@ -320,7 +341,7 @@ export class AIController {
         dec.tz = zOpp(longline ? rng.range(9.0, 10.3) : rng.range(6.5, 8.2));
         dec.charge = clamp(dec.charge + 0.15, 0, 1);
       }
-      return dec;
+      return this._fit(dec, plan, aggr);
     }
     // Gegner aus der Position gedrängt: zur offenen Seite angreifen
     const displaced = Math.abs(ox) > 2.1 && plan.slack > 0.1 && plan.height > 0.55 * me.scale;
@@ -331,7 +352,7 @@ export class AIController {
       dec.tz = zOpp(rng.chance(0.5) ? rng.range(9.2, 10.3) : rng.range(6.8, 8.0));
       dec.charge = clamp(dec.charge + 0.3, 0, 1);
       if (cz < HL - 1.5 && rng.chance(d.aiNetRush * 2)) this.approachNext = true;
-      return dec;
+      return this._fit(dec, plan, aggr);
     }
     const short = cz < HL - 3.0 && plan.height > 0.6 * me.scale && plan.slack > 0.2;
     if (short && rng.chance(0.35 + 0.6 * aggr)) {
@@ -342,11 +363,11 @@ export class AIController {
       dec.tz = zOpp(rng.range(9.3, 10.4));
       dec.charge = clamp(dec.charge + 0.25, 0, 1);
       if (rng.chance(d.aiNetRush * 2.6)) this.approachNext = true;
-      return dec;
+      return this._fit(dec, plan, aggr);
     }
     if (oppDeep && cz < HL + 0.3 && plan.height > 0.5 && plan.slack > 0.15 && rng.chance(d.aiDrop)) {
       dec.shot = 'drop'; dec.tx = rng.range(-2.4, 2.4); dec.tz = zOpp(rng.range(1.8, 3.0));
-      return dec;
+      return this._fit(dec, plan, aggr);
     }
     if (rng.chance(d.aiNetRush * 0.35) && cz < HL + 0.5) this.approachNext = true;   // Serve-and-volley-artiger Überraschungsangriff
     // Grundlinien-Rallye
@@ -364,6 +385,44 @@ export class AIController {
     dec.tx = side === 0 ? rng.range(-1.0, 1.0) : xIn(side, lm + rng.range(-0.3, 0.3));
     dec.tz = zOpp(clamp(rng.range(8.6, 10.2) + aggr * 0.4 - (margin - 0.8) * 0.8, 7.5, 10.6));
     dec.charge = clamp(dec.charge + impatience * 0.5, 0, 1);
+    return this._fit(dec, plan, aggr);
+  }
+
+  /**
+   * Risikoentscheidung mit dem eigenen Zielkreis (gleiches Modell wie beim Menschen): Ziel so weit nach innen ziehen,
+   * dass die Kreismitte aiKeep Radien von der Linie entfernt bleibt (Ungeduld in langen Ballwechseln senkt das).
+   * Kluge KI nimmt lieber Kraft heraus (kleinerer Kreis), als das Ziel weit von der gewünschten Stelle wegzuziehen,
+   * und zieht tiefe Bälle nicht voll durch (Netzregel).
+   */
+  _fit(dec, plan, aggr) {
+    const me = this.me, d = this.d, s = me.side, rng = this.rng;
+    const preset = shotPreset(dec.family, dec.shot);
+    if (plan.height / me.scale < RISK.lowBall && dec.charge >= RISK.netPower && preset !== 'lob' && rng.chance(0.3 + 0.7 * d.aiSmart)) dec.charge = RISK.netPower - 0.06;
+    const hitX = plan.contact[0];
+    const bv = plan.ballVel, inSpeed = Math.hypot(bv[0], bv[1], bv[2]);
+    const q = plan.slack < 0.12 ? 'stretch' : 'good';
+    const impatience = clamp((this.m.rally.hits - 6) / 10, 0, 0.6);
+    const keep = d.aiKeep * (1 - 0.35 * impatience) * (0.9 + 0.2 * (1 - aggr));
+    const tol = lerp(1.6, 0.45, d.aiSmart);              // so weit darf das Ziel wandern, bevor Kraft herausgenommen wird
+    const tx0 = dec.tx, tz0 = dec.tz;
+    const aim = this._fa || (this._fa = {});
+    let best = null;
+    for (let pw = dec.charge, k = 0; k < 5; k++, pw = Math.max(0.3, pw - 0.15)) {
+      let tx = tx0, tz = tz0;
+      for (let it = 0; it < 2; it++) {
+        targetToAim(s, hitX, tx, tz, aimShotFor(dec.family, dec.shot), aim);
+        const r = spreadRadius(me, preset, dec.family, pw, aim.lr, aim.depth, q, 0, inSpeed, false);
+        const m = r * keep;
+        const xMax = Math.max(0.3, SW - m);
+        tx = clamp(tx0, -xMax, xMax);
+        const dz = Math.abs(tz0), lo = preset === 'drop' ? 1.2 : 0.9 + m * 0.5, hi = Math.max(lo + 0.2, HL - m);
+        tz = -s * clamp(dz, lo, hi);
+      }
+      const shift = Math.hypot(tx - tx0, tz - tz0);
+      best = { pw, tx, tz };
+      if (shift <= tol || pw <= 0.3) break;
+    }
+    dec.charge = best.pw; dec.tx = best.tx; dec.tz = best.tz; dec.keep = keep;
     return dec;
   }
 }

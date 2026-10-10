@@ -12,11 +12,11 @@
 //   --shots <n>       Anzahl Screenshots, --interval <ms> Abstand (Standard 1000)
 //   --keys <seq>      Tastensequenz nach dem Warten, z.B. "KeyJ:down,wait:300,KeyJ:up,ArrowLeft:tap"
 //   --timeout <ms>    Gesamt-Timeout (Standard 60000)
-//   --nogpu           SwiftShader statt GPU erzwingen
+//   --nogpu           SwiftShader statt GPU erzwingen (außerhalb von macOS immer). CHROME=<pfad> überschreibt den Browser.
 //
 // Gibt Konsolenmeldungen und Fehler aus. Exit-Code 2, wenn unbehandelte Fehler auftraten.
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -34,14 +34,19 @@ if (!target) { console.error('usage: node tools/shot.mjs <url> [--out f.png] [--
 const url = /^https?:|^file:/.test(target) ? target : 'http://127.0.0.1:8123' + (target.startsWith('/') ? '' : '/') + target;
 const [W, H] = String(opt.size).split('x').map(Number);
 
-const CHROME = process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const MAC = process.platform === 'darwin';
+const CHROME = process.env.CHROME || (MAC ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+  : ['/opt/pw-browsers/chromium-1194/chrome-linux/chrome', '/usr/bin/chromium', '/usr/bin/google-chrome'].find((p) => existsSync(p)) || 'chromium');
+// Ohne Mac (Metal) gibt es headless meist keine GPU: SwiftShader. Als root startet Chromium nur ohne Sandbox.
+const SOFTWARE = opt.nogpu || !MAC;
 const profile = mkdtempSync(join(tmpdir(), 'tg-chrome-'));
 const flags = [
   '--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`, `--window-size=${W},${H}`,
   '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--mute-audio',
   '--autoplay-policy=no-user-gesture-required', '--ignore-gpu-blocklist', '--enable-unsafe-webgpu',
   '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows',
-  ...(opt.nogpu ? ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'] : ['--use-angle=metal', '--enable-gpu']),
+  ...(SOFTWARE ? ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'] : ['--use-angle=metal', '--enable-gpu']),
+  ...(process.getuid?.() === 0 ? ['--no-sandbox'] : []),
   'about:blank',
 ];
 const proc = spawn(CHROME, flags, { stdio: ['ignore', 'ignore', 'pipe'] });

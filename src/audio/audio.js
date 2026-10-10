@@ -290,7 +290,7 @@ export class AudioSystem {
     const power = Math.max(clamp01((v - 8) / 42), ev.power != null ? clamp01(ev.power) * 0.9 : 0);
     const kind = stroke === 'serve' ? 'serve' : /volley/.test(stroke) ? 'volley' : stroke === 'smash' ? 'smash' : 'ground';
     const slice = ev.shot === 'slice' || ev.shot === 'drop' || /slice/.test(stroke);
-    this.sfx.hit(t, { power, quality: ev.quality || 'good', kind, slice }, ev.pos || this._pos(ev.player));
+    this.sfx.hit(t, { power, quality: ev.quality || 'good', kind, slice, strong: !!ev.strong }, ev.pos || this._pos(ev.player));
     if (this.s.rally >= 4 && ev.quality === 'stretch' && chance(0.35)) this.crowd.react('ooh', 0.3 + Math.min(0.3, this.s.rally * 0.02), { delay: 0.15 });
   }
 
