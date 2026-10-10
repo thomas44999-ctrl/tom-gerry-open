@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rig Viewer</title>
+<style>
+  :root { --bg: #20242a; --fg: #e8e6e1; --dim: #9aa3ab; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 12px/1.4 ui-monospace, Menlo, monospace; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #hud { position: fixed; left: 10px; top: 8px; white-space: pre; pointer-events: none; text-shadow: 0 1px 2px #000; }
+  .lbl { position: fixed; color: var(--dim); pointer-events: none; text-shadow: 0 1px 2px #000; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">lade …</div>
+<script type="module">
+// Eigenständiger Betrachter für das Rig (unabhängig von der Engine): Lambert/Hemisphäre + gebackenes AO + GPU-Skinning.
+// URL-Parameter:
+//   pose=<name>|cycle (Standard cycle)   t=<s> (Zeit einfrieren)   views=0,45,90,180 (Gier-Winkel je Ansicht, Grad)
+//   cam=dist,pitchDeg,targetY            focus=<bone> (Kamera auf Gelenk, dist klein)   cell=0.008
+//   mode=shaded|weights|bones|ao|normals|curv   bone=<name> (für weights)   skel=1 (Knochen zeigen)   wire=1
+import { buildRigModel, buildRigPose, buildPoseCycleClip, RIG_POSES } from './scenes/rig.js';
+import { AnimLayer, createPose } from '../src/chars/pose.js';
+import { mat4 } from '../src/core/math.js';
+
+const Q = new URLSearchParams(location.search);
+const num = (k, d) => (Q.has(k) && !isNaN(+Q.get(k)) ? +Q.get(k) : d);
+const canvas = document.getElementById('c'), hud = document.getElementById('hud');
+const gl = canvas.getContext('webgl2', { antialias: true });
+const dpr = Math.min(2, devicePixelRatio || 1);
+
+const t0 = performance.now();
+const { mesh, skeletonDef: def, skeleton: sk } = buildRigModel({ cell: num('cell', 0.008) });
+const buildMs = performance.now() - t0;
+
+// ---- Shader
+const VS = `#version 300 es
+precision highp float; precision highp int;
+in vec3 a_pos; in vec3 a_nrm; in vec4 a_col; in vec4 a_data; in vec4 a_j; in vec4 a_w;
+uniform mat4 u_vp; uniform mat4 u_bones[64]; uniform int u_mode; uniform float u_bone;
+out vec3 v_n; out vec4 v_c; out vec4 v_d; out vec3 v_wp; out vec3 v_dbg;
+vec3 hue(float h){ return clamp(abs(mod(h*6.0+vec3(0,4,2),6.0)-3.0)-1.0,0.0,1.0); }
+void main(){
+  mat4 S = a_w.x*u_bones[int(a_j.x)] + a_w.y*u_bones[int(a_j.y)] + a_w.z*u_bones[int(a_j.z)] + a_w.w*u_bones[int(a_j.w)];
+  vec4 p = S * vec4(a_pos, 1.0);
+  v_n = mat3(S) * a_nrm; v_c = a_col; v_d = a_data; v_wp = p.xyz;
+  float wb = 0.0;
+  for (int k = 0; k < 4; k++) if (abs(a_j[k] - u_bone) < 0.5) wb += a_w[k];
+  v_dbg = u_mode == 1 ? mix(vec3(0.05,0.1,0.5), vec3(1.0,0.25,0.05), wb) + vec3(wb > 0.99 ? 0.3 : 0.0)
+        : u_mode == 2 ? hue(fract(a_j.x * 0.618)) * (0.55 + 0.45 * a_w.x) : vec3(0);
+  gl_Position = u_vp * p;
+}`;
+const FS = `#version 300 es
+precision highp float; precision highp int;
+in vec3 v_n; in vec4 v_c; in vec4 v_d; in vec3 v_wp; in vec3 v_dbg;
+uniform int u_mode; uniform vec3 u_eye;
+out vec4 o;
+void main(){
+  vec3 n = normalize(v_n);
+  vec3 L = normalize(vec3(0.45, 0.8, 0.55)), V = normalize(u_eye - v_wp), H = normalize(L + V);
+  float ao = v_d.y;
+  vec3 alb = v_c.rgb;
+  if (u_mode == 1 || u_mode == 2) alb = v_dbg;
+  if (u_mode == 3) alb = vec3(ao);
+  if (u_mode == 4) { o = vec4(n * 0.5 + 0.5, 1); return; }
+  if (u_mode == 5) alb = mix(vec3(0.2,0.3,1.0), vec3(1.0,0.3,0.2), clamp(v_d.z * 0.5 + 0.5, 0.0, 1.0));
+  float ndl = max(dot(n, L), 0.0), wrap = max((dot(n, L) + 0.35) / 1.35, 0.0);
+  float mat = v_d.x;
+  vec3 sun = vec3(1.0, 0.93, 0.82) * 2.6;
+  vec3 hemi = mix(vec3(0.20, 0.18, 0.16), vec3(0.45, 0.55, 0.72), n.y * 0.5 + 0.5);
+  float skin = (abs(mat) < 0.5 && u_mode == 0) ? 1.0 : 0.0;
+  vec3 diff = alb * (sun * mix(ndl, wrap, skin * 0.6) + hemi * (ao * 0.9 + 0.1));
+  float spec = pow(max(dot(n, H), 0.0), 40.0) * 0.25 * ndl;
+  float rim = pow(1.0 - max(dot(n, V), 0.0), 3.0) * 0.25 * ao;
+  vec3 col = diff * mix(1.0, ao, 0.35) + vec3(spec) + rim * vec3(0.6, 0.7, 0.9);
+  if (u_mode == 3) col = vec3(ao);
+  col = col / (1.0 + col * 0.25);
+  o = vec4(pow(col, vec3(1.0 / 2.2)), 1.0);
+}`;
+const GVS = `#version 300 es
+in vec3 a_pos; uniform mat4 u_vp; out vec3 v_p;
+void main(){ v_p = a_pos; gl_Position = u_vp * vec4(a_pos, 1.0); }`;
+const GFS = `#version 300 es
+precision highp float; in vec3 v_p; uniform vec3 u_feet[2]; out vec4 o;
+void main(){
+  vec2 g = abs(fract(v_p.xz * 4.0 - 0.5) - 0.5) / fwidth(v_p.xz * 4.0);
+  float line = 1.0 - min(min(g.x, g.y), 1.0);
+  float sh = 0.0;
+  for (int k = 0; k < 2; k++) { vec2 d = (v_p.xz - u_feet[k].xz) / vec2(0.12, 0.2); sh += exp(-dot(d, d) * 1.5) * 0.45; }
+  sh += exp(-dot(v_p.xz / vec2(0.35, 0.3), v_p.xz / vec2(0.35, 0.3)) * 1.2) * 0.25;
+  float f = exp(-length(v_p.xz) * 0.35);
+  vec3 c = mix(vec3(0.035, 0.04, 0.045), vec3(0.11, 0.115, 0.12), f) * (1.0 - min(sh, 0.7)) + line * 0.012 * f;
+  o = vec4(pow(c, vec3(1.0 / 2.2)), 1.0);
+}`;
+const LVS = `#version 300 es
+in vec3 a_pos; uniform mat4 u_vp; void main(){ gl_Position = u_vp * vec4(a_pos, 1.0); gl_PointSize = 6.0; }`;
+const LFS = `#version 300 es
+precision highp float; uniform vec3 u_col; out vec4 o; void main(){ o = vec4(u_col, 1); }`;
+
+function prog(vs, fs) {
+  const p = gl.createProgram();
+  for (const [t, s] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+    const sh = gl.createShader(t); gl.shaderSource(sh, s); gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+    gl.attachShader(p, sh);
+  }
+  gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+const P = prog(VS, FS), PG = prog(GVS, GFS), PL = prog(LVS, LFS);
+const U = (p, n) => gl.getUniformLocation(p, n);
+
+// ---- Mesh
+const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+function attr(prog, name, data, size, type = gl.FLOAT, norm = false) {
+  const loc = gl.getAttribLocation(prog, name); if (loc < 0) return;
+  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, type, norm, 0, 0);
+}
+attr(P, 'a_pos', mesh.positions, 3); attr(P, 'a_nrm', mesh.normals, 3); attr(P, 'a_col', mesh.colors, 4);
+attr(P, 'a_data', mesh.data, 4); attr(P, 'a_j', mesh.joints, 4, gl.UNSIGNED_BYTE); attr(P, 'a_w', mesh.weights, 4);
+const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
+gl.bindVertexArray(null);
+const wire = Q.get('wire') === '1';
+let wvao = null, wireCount = 0;
+if (wire) {
+  wvao = gl.createVertexArray(); gl.bindVertexArray(wvao);
+  attr(P, 'a_pos', mesh.positions, 3); attr(P, 'a_nrm', mesh.normals, 3); attr(P, 'a_col', mesh.colors, 4);
+  attr(P, 'a_data', mesh.data, 4); attr(P, 'a_j', mesh.joints, 4, gl.UNSIGNED_BYTE); attr(P, 'a_w', mesh.weights, 4);
+  const idx = mesh.indices, w = new Uint32Array(idx.length * 2);
+  for (let t = 0; t < idx.length; t += 3) { const a = idx[t], b = idx[t + 1], c = idx[t + 2]; w[2 * t] = a; w[2 * t + 1] = b; w[2 * t + 2] = b; w[2 * t + 3] = c; w[2 * t + 4] = c; w[2 * t + 5] = a; }
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer()); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, w, gl.STATIC_DRAW);
+  wireCount = w.length;
+  gl.bindVertexArray(null);
+}
+// Boden
+const gvao = gl.createVertexArray(); gl.bindVertexArray(gvao);
+attr(PG, 'a_pos', new Float32Array([-6, 0, -6, 6, 0, -6, 6, 0, 6, -6, 0, -6, 6, 0, 6, -6, 0, 6]), 3);
+gl.bindVertexArray(null);
+// Knochenlinien
+const lvao = gl.createVertexArray(); gl.bindVertexArray(lvao);
+const lbuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, lbuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(def.count * 6), gl.DYNAMIC_DRAW);
+const lloc = gl.getAttribLocation(PL, 'a_pos'); gl.enableVertexAttribArray(lloc); gl.vertexAttribPointer(lloc, 3, gl.FLOAT, false, 0, 0);
+gl.bindVertexArray(null);
+const lines = new Float32Array(def.count * 6);
+
+// ---- Pose
+const poseName = Q.get('pose') || 'cycle';
+const pose = createPose(def);
+const layer = new AnimLayer(def);
+const clip = buildPoseCycleClip(def);
+layer.play(clip, { fade: 0 });
+const frozenT = Q.has('t') ? num('t', 0) : null;
+const modeName = Q.get('mode') || 'shaded';
+const MODE = { shaded: 0, weights: 1, bones: 2, ao: 3, normals: 4, curv: 5 }[modeName] ?? 0;
+const boneSel = def.index[Q.get('bone') || 'forearm_r'] ?? 0;
+const poseList = Q.has('poses') ? Q.get('poses').split(',') : null;
+const views = (Q.get('views') || (Q.has('focus') ? '20,110' : poseList ? '30' : '0,45,90,180')).split(',').map(Number);
+const nViews = poseList ? Math.max(poseList.length, views.length) : views.length;
+const cam = (Q.get('cam') || '').split(',').map(Number);
+const focus = Q.get('focus');
+const showSkel = Q.get('skel') === '1';
+
+function resize() {
+  const w = Math.round(innerWidth * dpr), h = Math.round(innerHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+}
+const vp = mat4.create(), view = mat4.create(), proj = mat4.create();
+let last = performance.now(), simT = 0;
+const labels = [];
+function frame(now) {
+  resize();
+  const dt = Math.min(0.05, (now - last) / 1000); last = now; simT += dt;
+  if (poseName === 'cycle') {
+    if (frozenT !== null) { layer.tracks[0].time = 0; layer.update(frozenT); } else layer.update(dt);
+    pose.rot.set(layer.pose.rot); pose.t.set(layer.pose.t);
+  } else buildRigPose(def, poseName, pose);
+  sk.update(pose);
+  gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.125, 0.14, 0.165, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  const n = nViews, cols = Math.min(n, num('cols', n <= 4 ? n : Math.ceil(n / 2))), rows = Math.ceil(n / cols);
+  const vw = Math.floor(canvas.width / cols), vh = Math.floor(canvas.height / rows);
+  let tgt = [0, cam[2] || 0.92, 0], dist = cam[0] || 3.6;
+  if (focus && def.index[focus] !== undefined) { const p = sk.getWorldPos(focus); tgt = [p[0], p[1], p[2]]; dist = cam[0] || 0.75; }
+  const pitch = (cam[1] !== undefined && !isNaN(cam[1]) ? cam[1] : 8) * Math.PI / 180;
+  const fl = sk.getWorldPos('foot_l'), fr = sk.getWorldPos('foot_r');
+  for (let v = 0; v < n; v++) {
+    const cx = (v % cols) * vw, cy = canvas.height - (Math.floor(v / cols) + 1) * vh;
+    gl.viewport(cx, cy, vw, vh); gl.scissor(cx, cy, vw, vh);
+    if (poseList) { buildRigPose(def, poseList[v % poseList.length], pose); sk.update(pose); }
+    if (focus && def.index[focus] !== undefined) { const p = sk.getWorldPos(focus); tgt = [p[0], p[1], p[2]]; }
+    const yaw = views[v % views.length] * Math.PI / 180;
+    const eye = [tgt[0] + Math.sin(yaw) * Math.cos(pitch) * dist, tgt[1] + Math.sin(pitch) * dist, tgt[2] + Math.cos(yaw) * Math.cos(pitch) * dist];
+    mat4.lookAt(view, eye, tgt, [0, 1, 0]); mat4.perspective(proj, vw / vh < 0.8 ? 0.68 : 0.55, vw / vh, 0.02, 50); mat4.multiply(vp, proj, view);
+    // Boden
+    gl.useProgram(PG); gl.uniformMatrix4fv(U(PG, 'u_vp'), false, vp);
+    gl.uniform3fv(U(PG, 'u_feet'), new Float32Array([fl[0], 0, fl[2], fr[0], 0, fr[2]]));
+    gl.bindVertexArray(gvao); gl.disable(gl.CULL_FACE); gl.drawArrays(gl.TRIANGLES, 0, 6); gl.enable(gl.CULL_FACE);
+    // Figur
+    gl.useProgram(P);
+    gl.uniformMatrix4fv(U(P, 'u_vp'), false, vp); gl.uniformMatrix4fv(U(P, 'u_bones'), false, sk.skin);
+    gl.uniform1i(U(P, 'u_mode'), MODE); gl.uniform1f(U(P, 'u_bone'), boneSel); gl.uniform3fv(U(P, 'u_eye'), eye);
+    gl.bindVertexArray(vao); gl.drawElements(gl.TRIANGLES, mesh.indices.length, gl.UNSIGNED_INT, 0);
+    if (wire) {
+      gl.enable(gl.POLYGON_OFFSET_FILL);
+      gl.uniform1i(U(P, 'u_mode'), 3); gl.depthFunc(gl.LEQUAL);
+      gl.bindVertexArray(wvao); gl.drawElements(gl.LINES, wireCount, gl.UNSIGNED_INT, 0); gl.depthFunc(gl.LESS);
+    }
+    if (showSkel) {
+      for (let i = 0; i < def.count; i++) {
+        const p = def.parents[i]; const a = sk.worldBuf, o = 16 * i, q = 16 * Math.max(p, 0);
+        lines.set([a[o + 12], a[o + 13], a[o + 14], a[q + 12], a[q + 13], a[q + 14]], 6 * i);
+      }
+      gl.useProgram(PL); gl.uniformMatrix4fv(U(PL, 'u_vp'), false, vp); gl.uniform3f(U(PL, 'u_col'), 1, 0.85, 0.2);
+      gl.bindVertexArray(lvao); gl.bindBuffer(gl.ARRAY_BUFFER, lbuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, lines);
+      gl.disable(gl.DEPTH_TEST); gl.drawArrays(gl.LINES, 0, def.count * 2); gl.drawArrays(gl.POINTS, 0, def.count * 2); gl.enable(gl.DEPTH_TEST);
+    }
+  }
+  const cur = poseList ? poseList.join(' | ') : poseName === 'cycle' ? clipKeyName(layer.current ? layer.current.time : 0) : poseName;
+  hud.textContent = `Rig-Viewer · Pose: ${cur} · Modus: ${modeName}${MODE === 1 ? ' (' + def.names[boneSel] + ')' : ''}\n`
+    + `Mesh: ${mesh.vertexCount} Vertices, ${mesh.triangleCount} Dreiecke · polygonize ${mesh.stats.ms.toFixed(0)} ms (gesamt ${buildMs.toFixed(0)} ms)\n`
+    + `Ansichten (Gier°): ${views.join(', ')}`;
+  window.__rig = { ready: true, verts: mesh.vertexCount, tris: mesh.triangleCount, ms: mesh.stats.ms, buildMs, frames: (window.__rig?.frames || 0) + 1 };
+  requestAnimationFrame(frame);
+}
+const names = ['rest', 'armsForward', 'armsUp', 'crouch', 'twist', 'forehand', 'serve', 'run', 'elbowsKnees'];
+function clipKeyName(t) { const seg = 1.3; const k = Math.floor(t / seg); const f = t - k * seg; return f < 0.6 ? names[k % names.length] : names[k % names.length] + ' → ' + names[(k + 1) % names.length]; }
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#07100b">
+<title>Tom &amp; Gerry Open</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #07100b; overflow: hidden; overscroll-behavior: none; }
+  body { -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; outline: none; background: #07100b; }
+  #tg-fatal {
+    position: fixed; inset: 0; z-index: 100; display: none; align-items: center; justify-content: center; padding: 24px;
+    background: radial-gradient(120% 90% at 50% 20%, #173a26 0%, #07100b 70%); color: #f3efe3;
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; text-align: center;
+  }
+  #tg-fatal .box { max-width: 560px; }
+  #tg-fatal h1 { font-size: 26px; margin: 0 0 10px; letter-spacing: .02em; color: #f3d98a; }
+  #tg-fatal p { margin: 0 0 10px; opacity: .88; }
+  #tg-fatal pre { text-align: left; font: 12px/1.4 ui-monospace, Menlo, monospace; background: rgba(0,0,0,.35); padding: 10px 12px; border-radius: 8px; white-space: pre-wrap; max-height: 30vh; overflow: auto; opacity: .8; }
+  #tg-fatal button { margin-top: 8px; font: inherit; color: #07100b; background: #f3d98a; border: 0; border-radius: 999px; padding: 8px 20px; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" tabindex="0" aria-label="Tom &amp; Gerry Open – Spielfeld"></canvas>
+<div id="tg-fatal" role="alert"><div class="box"><h1></h1><p class="msg"></p><pre></pre><button type="button" onclick="location.reload()">Neu laden</button></div></div>
+<script type="module" src="src/main.js"></script>
+</body>
+</html>

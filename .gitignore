@@ -1,0 +1,9 @@
+# macOS
+.DS_Store
+
+# Gebaute Spieldatei: entsteht mit node tools/build.mjs, bleibt im Drive zum Doppelklicken
+tom-gerry-open.html
+dist/
+
+# Abhängigkeiten (gibt es nicht, aber falls doch: nie ins Repo und nie ins Drive)
+node_modules/
